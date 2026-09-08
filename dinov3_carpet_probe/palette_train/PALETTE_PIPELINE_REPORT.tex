@@ -1,0 +1,496 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{geometry}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\geometry{margin=1in}
+
+\title{A Frozen-DINOv3 Query-Based Pipeline for Variable-Cardinality Palette Prediction}
+\author{Project Report}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This document describes the implemented supervised pipeline for palette prediction from JPG images. The system maps one image to an unordered set of RGB colors with variable cardinality using a frozen DINOv3 ViT-L/16 backbone, a DETR-style palette query decoder, and Hungarian bipartite matching. The report is written in a scientific-paper style and explains the method step by step, including data validation, preprocessing, feature extraction, mask handling, side-channel color features, loss design, evaluation metrics, inference, and training diagnostics.
+\end{abstract}
+
+\section{Problem Definition}
+
+The task is to predict an unordered palette from a single JPG image:
+\begin{equation}
+I \mapsto \mathcal{P} = \{c_1, c_2, \dots, c_K\},
+\end{equation}
+where each color $c_i \in [0,255]^3$ is an RGB triplet and $K$ is image-dependent. Since palette colors have no semantic ordering, the target is a \emph{set}, not a sequence. Therefore, the learning objective must be permutation invariant with respect to the target row order in the annotation JSON.
+
+The implemented architectural choice is:
+\begin{center}
+\texttt{JPG image} $\rightarrow$ \texttt{Frozen DINOv3 features} $\rightarrow$ \texttt{Query decoder} $\rightarrow$ \texttt{unordered RGB palette}.
+\end{center}
+
+\section{Data Sources and Pairing}
+
+The dataset is formed by two aligned directories:
+\begin{itemize}[leftmargin=2em]
+    \item images: \texttt{E:/End-to-End/Data/jpg}
+    \item palette annotations: \texttt{E:/End-to-End/Data/palettes}
+\end{itemize}
+
+Files are paired strictly by zero-padded stem:
+\begin{equation}
+\texttt{000000.jpg} \leftrightarrow \texttt{000000.json}.
+\end{equation}
+
+Each annotation is expected to contain:
+\begin{itemize}[leftmargin=2em]
+    \item \texttt{sample\_id}
+    \item \texttt{num\_colors}
+    \item \texttt{rgb}
+    \item \texttt{hex}
+\end{itemize}
+
+\section{Dataset Validation and Filtering}
+
+\subsection{Validation Rules}
+
+The validation stage performs the following checks for every pair:
+\begin{enumerate}[leftmargin=2em]
+    \item Verify that the file stem is numeric.
+    \item Verify that \texttt{sample\_id = int(stem)}.
+    \item Verify that
+    \begin{equation}
+    \texttt{num\_colors} = |\texttt{rgb}| = |\texttt{hex}|.
+    \end{equation}
+    \item Verify that every RGB entry contains exactly three integers in $[0,255]$.
+    \item Verify that every HEX string matches its RGB counterpart exactly.
+    \item Detect duplicate RGB values inside the same palette.
+\end{enumerate}
+
+Originally, duplicate RGB values were only warnings. In the revised pipeline, duplicate colors are treated as invalid training targets because the target is mathematically a set and repeated elements create ambiguity.
+
+\subsection{Training Cardinality Cap}
+
+The training set is explicitly restricted to palettes with at most 12 colors:
+\begin{equation}
+K \leq 12.
+\end{equation}
+
+This policy was introduced after observing extreme outliers with very large palette cardinalities. Using a very large
+\texttt{max\_num\_colors} would force the model to allocate many unnecessary negative queries and destabilize presence supervision.
+
+Thus, the trainable subset is:
+\begin{equation}
+\mathcal{D}_{trainable} = \{(I, \mathcal{P}) \mid |\mathcal{P}| \leq 12\}.
+\end{equation}
+
+Samples above this threshold are not silently discarded; they are reported explicitly in the validation output.
+
+\section{Preprocessing}
+
+\subsection{Aspect-Preserving Resize and Letterboxing}
+
+The image transform proceeds in four steps:
+\begin{enumerate}[leftmargin=2em]
+    \item Load the JPG as RGB.
+    \item Resize the image while preserving aspect ratio so that the long side becomes 512.
+    \item Place the resized content into a fixed $512 \times 512$ square canvas via letterboxing.
+    \item Normalize the tensor using the exact mean and standard deviation required by \texttt{vitl16\_lvd}.
+\end{enumerate}
+
+Let the raw image be $I \in \mathbb{R}^{H \times W \times 3}$. After resize and letterbox, the model receives
+\begin{equation}
+\tilde{I} \in \mathbb{R}^{512 \times 512 \times 3}.
+\end{equation}
+
+\subsection{Valid-Pixel Mask}
+
+The preprocessing stage also produces a valid-content mask
+\begin{equation}
+M_{pix} \in \{0,1\}^{512 \times 512},
+\end{equation}
+where
+\begin{equation}
+M_{pix}(x,y)=
+\begin{cases}
+1 & \text{if } (x,y) \text{ belongs to resized real image content},\\
+0 & \text{if } (x,y) \text{ belongs to letterbox padding}.
+\end{cases}
+\end{equation}
+
+This mask is critical because padded areas must not be interpreted as valid palette evidence.
+
+\subsection{Raw Unnormalized Tensor}
+
+Besides the normalized input tensor, the pipeline preserves the raw pre-normalization tensor. This is needed for the chromatic side-channel described later, because exact color statistics should be computed in raw image space rather than from standardized backbone input.
+
+\section{Frozen DINOv3 Backbone}
+
+The backbone is the official DINOv3 ViT-L/16 LVD model, referenced in the codebase as \texttt{vitl16\_lvd}. The backbone is frozen:
+\begin{equation}
+\frac{\partial \mathcal{L}}{\partial \theta_{DINO}} = 0.
+\end{equation}
+
+All training updates are restricted to the palette head.
+
+\subsection{Multi-Level Intermediate Features}
+
+The feature extractor obtains normalized intermediate patch tokens and the class token using the public DINOv3 API. The selected transformer block indices are
+\begin{equation}
+[5, 11, 17, 23].
+\end{equation}
+
+These should be understood as \emph{multi-level blocks}, not literally the last four blocks. The design rationale is that color-sensitive appearance cues may survive better when features are aggregated across depth instead of relying only on the final representation.
+
+For each selected block $l$, the backbone returns:
+\begin{equation}
+T^{(l)} \in \mathbb{R}^{N \times C}, \qquad \text{CLS}^{(l)} \in \mathbb{R}^{C},
+\end{equation}
+where $N$ is the number of image patches and $C$ is the hidden dimension of the backbone.
+
+The multi-level patch memory is formed by concatenation:
+\begin{equation}
+T_{fused} = \text{concat}\left(T^{(5)}, T^{(11)}, T^{(17)}, T^{(23)}\right) \in \mathbb{R}^{N \times 4C}.
+\end{equation}
+
+The final class token is taken from the deepest selected block:
+\begin{equation}
+\text{CLS}_{final} = \text{CLS}^{(23)}.
+\end{equation}
+
+\section{Patch-Space Masking}
+
+Because the backbone operates at patch resolution, the pixel mask is converted into a patch mask:
+\begin{equation}
+M_{patch} \in \{0,1\}^{N}.
+\end{equation}
+
+Each patch is marked valid if most of its pixels correspond to true image content. This patch mask is then used as a transformer memory padding mask:
+\begin{equation}
+\texttt{memory\_key\_padding\_mask} = \neg M_{patch}.
+\end{equation}
+
+This ensures that letterbox padding does not influence:
+\begin{itemize}[leftmargin=2em]
+    \item cross-attention from queries to memory,
+    \item pooled count features,
+    \item auxiliary count evidence.
+\end{itemize}
+
+\section{Raw-Color Side-Channel}
+
+DINOv3 is strong at structural and semantic representation learning, but exact RGB prediction may require more direct access to pixel-level chromatic statistics. Therefore, the implemented pipeline augments the DINO memory with a compact patch-wise raw-color descriptor.
+
+For each valid patch, the side-channel computes:
+\begin{itemize}[leftmargin=2em]
+    \item mean RGB,
+    \item RGB standard deviation,
+    \item RGB minimum,
+    \item RGB maximum,
+    \item mean OKLab.
+\end{itemize}
+
+Let this descriptor be:
+\begin{equation}
+R_i \in \mathbb{R}^{d_r}
+\end{equation}
+for patch $i$. Then the final memory token for patch $i$ is formed as:
+\begin{equation}
+Z_i = W \left[ T_{fused,i} \, \Vert \, R_i \right],
+\end{equation}
+where $\Vert$ denotes concatenation and $W$ is a trainable projection.
+
+This preserves the original backbone choice while allowing the head to ``read'' direct color evidence from the image.
+
+\section{Query-Based Palette Decoder}
+
+The head is DETR-like and uses a fixed number of learned queries:
+\begin{equation}
+Q = K_{max} + Q_{spare}.
+\end{equation}
+
+With the current training cap:
+\begin{equation}
+K_{max}=12, \qquad Q_{spare}=4, \qquad Q=16.
+\end{equation}
+
+Each query is decoded through a pre-normalized transformer decoder. Each decoded query emits:
+\begin{itemize}[leftmargin=2em]
+    \item RGB prediction $\hat{c}_q \in [0,1]^3$,
+    \item presence logit $\hat{p}_q \in \mathbb{R}$.
+\end{itemize}
+
+The model additionally predicts the global palette count:
+\begin{equation}
+\hat{K} = \arg\max \texttt{count\_logits}.
+\end{equation}
+
+\section{Count Prediction}
+
+Count prediction is not based only on CLS. Instead, the implemented count branch aggregates three signals:
+\begin{equation}
+f_{count} = \left[
+\text{CLS}_{proj}
+\; \Vert \;
+\text{MeanPool}(Z, M_{patch})
+\; \Vert \;
+\text{AttnPool}(Z, M_{patch})
+\right].
+\end{equation}
+
+This is motivated by the concern that rare colors may weakly affect CLS alone. Masked mean pooling and masked attention pooling provide additional evidence grounded in valid patch memory.
+
+\section{Hungarian Matching}
+
+Because the target is an unordered set, the model uses one-to-one Hungarian assignment between predicted queries and target colors.
+
+For predicted query $q$ and target color $j$, the matching cost is:
+\begin{equation}
+\mathcal{C}_{qj}
+=
+\lambda_{rgb} \| \hat{c}_q - c_j \|_1
++
+\lambda_{perc} d_{OKLab}(\hat{c}_q, c_j)
+-
+\lambda_{pres} \log \sigma(\hat{p}_q).
+\end{equation}
+
+The matching is detached from gradient flow and solved with Hungarian bipartite assignment.
+
+\section{Loss Function}
+
+After matching, the final training loss is composed of several terms.
+
+\subsection{Matched RGB Regression}
+
+For matched pairs $(q,j)$:
+\begin{equation}
+\mathcal{L}_{rgb}
+=
+\frac{1}{B}
+\sum_{b=1}^{B}
+\left(
+\frac{1}{|\mathcal{M}_b|}
+\sum_{(q,j)\in\mathcal{M}_b}
+\text{SmoothL1}(\hat{c}_{b,q}, c_{b,j})
+\right).
+\end{equation}
+
+The key design detail is that the loss is averaged \emph{inside each image first}, then across the batch. This prevents images with large palettes from dominating optimization.
+
+\subsection{Perceptual Color Loss}
+
+For the same matched pairs:
+\begin{equation}
+\mathcal{L}_{perc}
+=
+\frac{1}{B}
+\sum_{b=1}^{B}
+\left(
+\frac{1}{|\mathcal{M}_b|}
+\sum_{(q,j)\in\mathcal{M}_b}
+d_{OKLab}(\hat{c}_{b,q}, c_{b,j})
+\right).
+\end{equation}
+
+\subsection{Presence Loss}
+
+Presence supervision is strongly imbalanced because many queries do not correspond to true palette entries. Therefore, the implementation uses a focal-style binary loss:
+\begin{equation}
+\mathcal{L}_{pres} = \text{FocalBCE}(\hat{p}, y_{pres}).
+\end{equation}
+
+Positive and negative presence losses are logged separately for diagnostics.
+
+\subsection{Count Loss}
+
+Count is supervised with categorical cross-entropy:
+\begin{equation}
+\mathcal{L}_{count}
+=
+\text{CE}(\texttt{count\_logits}, K).
+\end{equation}
+
+\subsection{Count Consistency Loss}
+
+The model maintains a second implicit count estimate from the sum of presence probabilities:
+\begin{equation}
+\hat{K}_{pres} = \sum_q \sigma(\hat{p}_q).
+\end{equation}
+
+Consistency is encouraged with:
+\begin{equation}
+\mathcal{L}_{cons}
+=
+\left| \hat{K}_{pres} - K \right|.
+\end{equation}
+
+\subsection{Auxiliary Decoder Losses}
+
+Intermediate decoder layers can also produce RGB and presence outputs. Auxiliary supervision is applied to those intermediate predictions, but count is not duplicated at every layer.
+
+\subsection{Total Loss}
+
+The final loss is:
+\begin{equation}
+\mathcal{L}
+=
+\lambda_{rgb}\mathcal{L}_{rgb}
++
+\lambda_{perc}\mathcal{L}_{perc}
++
+\lambda_{pres}\mathcal{L}_{pres}
++
+\lambda_{count}\mathcal{L}_{count}
++
+\lambda_{cons}\mathcal{L}_{cons}
++
+\lambda_{aux}\mathcal{L}_{aux}.
+\end{equation}
+
+\section{Evaluation Metrics}
+
+All evaluation is Hungarian-aligned and permutation invariant. Reported metrics include:
+\begin{itemize}[leftmargin=2em]
+    \item count accuracy,
+    \item count MAE,
+    \item matched RGB MAE,
+    \item $\Delta E00$ mean, median, P90, P95,
+    \item percentages with $\Delta E00 \le 1,2,5$,
+    \item exact-cardinality rate,
+    \item palette success rate,
+    \item false-positive query rate,
+    \item false-negative color rate.
+\end{itemize}
+
+\subsection{Count Agreement Metrics}
+
+Two count pathways are compared explicitly:
+\begin{equation}
+\hat{K}_{head} = \arg\max \texttt{count\_logits},
+\qquad
+\hat{K}_{pres} = \text{round}\left(\sum_q \sigma(\hat{p}_q)\right).
+\end{equation}
+
+The pipeline reports:
+\begin{itemize}[leftmargin=2em]
+    \item count-head accuracy,
+    \item presence-derived count accuracy,
+    \item absolute disagreement $|\hat{K}_{head} - \hat{K}_{pres}|$.
+\end{itemize}
+
+\subsection{Unified Set Error}
+
+To avoid selecting checkpoints based only on matched-color quality, a unified set-level error is used:
+\begin{equation}
+E_{set}
+=
+\frac{
+\sum_i \min(\Delta E00_i, c)
++
+c |K - \hat{K}|
+}{
+\max(K,\hat{K})
+},
+\end{equation}
+with default penalty constant $c=10$.
+
+This metric jointly reflects color quality and cardinality correctness and is used for:
+\begin{itemize}[leftmargin=2em]
+    \item best checkpoint selection,
+    \item early stopping,
+    \item model comparison.
+\end{itemize}
+
+\section{Training Loop}
+
+The training loop uses:
+\begin{itemize}[leftmargin=2em]
+    \item AdamW,
+    \item warmup plus cosine decay,
+    \item automatic mixed precision,
+    \item gradient clipping,
+    \item optional gradient accumulation,
+    \item deterministic seeding,
+    \item checkpoint save/resume.
+\end{itemize}
+
+Extensive progress tracking was added through tqdm bars and epoch-level summaries.
+
+\section{Early Stopping}
+
+Early stopping was made deliberately more conservative by introducing:
+\begin{itemize}[leftmargin=2em]
+    \item larger patience,
+    \item a minimum number of epochs before patience is consumed,
+    \item a minimum improvement threshold $\delta$.
+\end{itemize}
+
+This reduces the chance of terminating training because of minor metric fluctuations.
+
+\section{Inference}
+
+At inference time, the model:
+\begin{enumerate}[leftmargin=2em]
+    \item predicts count logits,
+    \item ranks queries by presence probability,
+    \item keeps the highest-confidence unique RGB colors,
+    \item rounds them deterministically to 8-bit RGB,
+    \item serializes them with exact uppercase HEX values.
+\end{enumerate}
+
+A lightweight UI was added for checkpoint loading, image upload, palette-swatch visualization, and JSON inspection.
+
+\section{Testing}
+
+The current codebase includes focused tests for:
+\begin{itemize}[leftmargin=2em]
+    \item dataset pairing and validation,
+    \item collation,
+    \item head output shape,
+    \item Hungarian matching,
+    \item permutation invariance,
+    \item presence supervision,
+    \item count loss,
+    \item patch-mask effect,
+    \item unified set error,
+    \item JSON formatting,
+    \item checkpoint round-trip,
+    \item preprocessing shape guarantees.
+\end{itemize}
+
+At the latest check, the suite status was:
+\begin{equation}
+17 \text{ passed}, \qquad 2 \text{ skipped}.
+\end{equation}
+
+\section{Current Status and Remaining Empirical Work}
+
+The code path for the revised pipeline has been implemented, but a few empirical results still need to be regenerated after the latest changes:
+\begin{itemize}[leftmargin=2em]
+    \item full preflight report on the real dataset,
+    \item actual tiny-overfit results on the revised architecture,
+    \item refreshed quantitative report with current runtime metrics.
+\end{itemize}
+
+\section{Conclusion}
+
+The implemented method now provides a stronger and more principled foundation for palette prediction than the initial version. The main improvements are:
+\begin{itemize}[leftmargin=2em]
+    \item trainable-set filtering with explicit reporting,
+    \item mask-aware letterbox handling,
+    \item raw-color side-channel fused with frozen DINO features,
+    \item more stable matching and presence supervision,
+    \item set-level checkpoint metric,
+    \item stronger diagnostics and testing infrastructure.
+\end{itemize}
+
+In summary, the system remains faithful to the original high-level design --- frozen DINOv3 plus DETR-style set decoding --- while significantly improving robustness in data handling, optimization stability, and evaluation quality.
+
+\end{document}

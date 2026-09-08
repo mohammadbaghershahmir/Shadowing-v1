@@ -1,0 +1,34 @@
+# CSN-V4 tiled production — core weight 1.0, halo 0.35
+model:
+  name: CarpetShadeNetV4
+  local_size: 512
+  context_size: 1024
+  global_long_side: 1024
+  dino:
+    cache_dir: "E:/Shadowing/Dataset_V4/global_tokens_csn_v4_bw"
+  convnext:
+    model_name: "convnextv2_base.fcmae_ft_in22k_in1k"
+    pretrained: true
+
+data:
+  dataset_root: "E:/Shadowing/Dataset_V4"
+  train_tiles: "manifests/train_tiles_bw.jsonl"
+  scenes: "manifests/scenes.jsonl"
+  input_mode: "bw"
+  halo_loss_weight: 0.35
+  supervision_mode: "tiled_production"
+
+loss:
+  ordinal: 0.0
+  use_ordinal_head: false
+  base_refined_consistency: 0.10
+
+train:
+  optimizer_steps: 3000
+  teacher_forcing: 0.0
+  mode: production
+
+inference:
+  tile_size: 512
+  halo: 64
+  stride: 384

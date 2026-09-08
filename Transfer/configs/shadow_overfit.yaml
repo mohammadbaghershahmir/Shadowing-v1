@@ -1,0 +1,86 @@
+# Overfit / memorization experiment on Dataset V2.
+# Train on all train(+val merged) crops, score on train mIoU, no held-out val.
+profile: BEST_V1
+data:
+  metadata_dir: "E:/Shadowing/dataset_metadata_v2"
+  train_crops: "train_crops.jsonl"
+  val_crops: "val_crops.jsonl"
+  crop_size: 512
+  valid_center: 512
+  ignore_index: -100
+  max_crops_per_source_in_batch: 2
+  augment_dihedral: false
+  allowed_dihedral: [0, 1, 2, 3, 4, 5, 6, 7]
+  fold: 0
+  group_manifest: "design_families.json"
+local_encoder:
+  family: convnextv2
+  model_name: convnextv2_base.fcmae_ft_in22k_in1k
+  pretrained: true
+  trainable: true
+  out_indices: [0, 1, 2, 3]
+  layerwise_lr_decay: 0.875
+  drop_path: 0.0
+dino:
+  model_name: vitl16_lvd
+  hub_entry: dinov3_vitl16
+  frozen: true
+  shared_weights: true
+  patch_size: 16
+  token_dim: 1024
+  input_size: 512
+  feature_layer: 23
+  repo_dir: "E:/Dino/dinov3"
+  checkpoint: "E:/Dino/dinov3/dinov3_carpet_probe/weights/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"
+  cache_dir: "E:/Shadowing/dataset_metadata_v2/global_tokens"
+  cache_dtype: float16
+  require_cache: true
+  use_local_view: true
+  use_global_view: true
+model:
+  decoder_dim: 256
+  stem_channels: [32, 64, 96]
+  refine_channels: 64
+  use_structural_stem: true
+  cross_attn_blocks: 1
+  cross_attn_heads: 4
+  gate_init_local: 0.05
+  gate_init_global: 0.05
+  decoder_dropout: 0.0
+  num_classes: 3
+loss:
+  ce: {weight: 1.00, class_weights: [0.875, 0.892, 1.233]}
+  dice: {weight: 0.30}
+  aux: {weight: 0.10}
+  transition: {weight: 0.15, ramp_start: 0.05, ramp_end: 0.15, neighbors: 4, dilate: 1}
+  affinity: {weight: 0.05, ramp_start: 0.10, ramp_end: 0.20, offsets: [1, 2, 4, 8], max_pairs: 4096, same_component: true}
+  main_logit_boundary: true
+train:
+  micro_batch: 1
+  grad_accum: 8
+  amp: auto_bf16_else_fp16
+  optimizer: adamw
+  lr_new: 1.25e-4
+  lr_backbone: 1.5e-5
+  weight_decay: 0.01
+  no_decay: [bias, norm]
+  warmup_ratio: 0.03
+  schedule: cosine
+  min_lr: 1.0e-6
+  grad_clip: 1.0
+  total_steps: 6000
+  hard_cap_steps: 8000
+  val_every_steps: 200
+  full_image_val_every_steps: 999999
+  early_stop_patience_full_image: 999999
+  seed: 42
+  activation_checkpointing: true
+  disable_val: true
+  score_on_train: true
+  train_eval_max_batches: 64
+  checkpoint_every_steps: 200
+eval:
+  tile: 512
+  halo: 64
+  stride: 384
+  score: {miou: 0.55, bf1_2px: 0.30, small_comp_miou: 0.15}

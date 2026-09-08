@@ -1,0 +1,70 @@
+model_key: vitl16_lvd
+weights_dir: 'E:/Dino/dinov3/dinov3_carpet_probe/weights'
+checkpoint_path: null
+repo_dir: 'E:/Dino/dinov3'
+
+image_dir: 'E:/End-to-End/Data/jpg'
+palette_dir: 'E:/End-to-End/Data/palettes'
+manifest_dir: 'E:/Dino/dinov3/dinov3_carpet_probe/palette_train/manifests'
+run_root: 'E:/Dino/dinov3/dinov3_carpet_probe/palette_train/runs'
+prediction_root: 'E:/Dino/dinov3/dinov3_carpet_probe/palette_train/predictions'
+
+seed: 0
+split_seed: 0
+train_ratio: 0.8
+val_ratio: 0.1
+test_ratio: 0.1
+
+batch_size: 16
+num_workers: 0
+pin_memory: true
+prefetch_factor: null
+persistent_workers: false
+
+device: cuda
+amp: true
+input_long_side: 512
+pad_multiple: 16
+mean: [0.485, 0.456, 0.406]
+std: [0.229, 0.224, 0.225]
+fusion_layers: [5, 11, 17, 23]
+allow_hflip: false
+allow_vflip: false
+
+max_num_colors: 12
+spare_queries: 4
+head_dim: 256
+decoder_layers: 4
+decoder_heads: 8
+decoder_ffn_dim: 1024
+dropout: 0.1
+aux_loss: true
+
+epochs: 50
+lr: 0.0001
+weight_decay: 0.01
+warmup_steps: 500
+grad_clip_norm: 1.0
+grad_accum_steps: 1
+validate_every_steps: 0
+validate_every_epochs: 1
+early_stopping_patience: 20
+early_stopping_min_epochs: 5
+early_stopping_min_delta: 0.001
+best_metric: val_set_error
+maximize_best_metric: false
+
+matcher_rgb_weight: 1.0
+matcher_perceptual_weight: 1.0
+matcher_presence_weight: 0.25
+
+loss_rgb: 1.0
+loss_perceptual: 1.0
+loss_presence: 1.0
+loss_count: 1.0
+loss_count_consistency: 0.1
+aux_loss_weight: 0.5
+
+tiny_overfit_num_samples: 16
+tiny_overfit_epochs: 200
+tiny_overfit_target_loss: 0.25

@@ -1,0 +1,1 @@
+"""Shadow model architecture package."""

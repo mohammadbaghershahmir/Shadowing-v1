@@ -1,0 +1,26 @@
+seed: 0
+device: cuda
+# Match official notebooks (pca.ipynb / dense_sparse_matching.ipynb): autocast float32 on CUDA
+autocast_dtype: float32
+global_long_side: 1024
+tile_size: 512
+overlap: 128
+tile_batch_size: 1
+k_values: [4, 8, 12, 16]
+top_n_correspondence: 8
+nms_radius_patches: 3
+pca_percentiles: [1, 99]
+models_order: [convnext_l_lvd, vitl16_lvd, vitl16_sat]
+modes: [global, tiled]
+feature_kinds: [final, fused]
+loader: torch_hub  # torch_hub | transformers
+repo_dir: null  # null => auto-detect parent of dinov3_carpet_probe
+weights_dir: null  # null => dinov3_carpet_probe/weights
+output_root: null  # null => dinov3_carpet_probe/outputs
+anchor_labels:
+  - background
+  - motif_fill
+  - shade
+  - border
+  - outline
+  - rare_detail

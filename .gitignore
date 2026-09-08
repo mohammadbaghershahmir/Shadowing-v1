@@ -1,0 +1,108 @@
+# =============================================================================
+# Shadowing / CSN-V4 — ignore heavy data, weights, runs, and local clutter
+# =============================================================================
+
+# ----- Python / build -----
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+.cache/
+
+# ----- Virtual envs -----
+.venv/
+venv/
+env/
+ENV/
+
+# ----- IDE / OS -----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ----- Jupyter -----
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+**/notebooks/
+
+# ----- Shell helpers (optional local scripts) -----
+*.sh
+
+# ----- Model weights & checkpoints (very large) -----
+weight/
+weights/
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.bin
+!**/fixtures/**/*.pt
+
+# ----- Training / eval run artifacts -----
+Transfer/runs/
+runs/
+**/runs/
+**/wandb/
+**/mlruns/
+**/lightning_logs/
+**/tensorboard/
+**/tb_logs/
+
+# ----- Datasets & generated tiles (GB-scale) -----
+converted_output/
+Dataset_V1/
+Dataset_V2/
+Dataset_V3/
+Dataset_V4/
+**/materialized/
+**/global_tokens*/
+**/global_tokens_*/
+
+# Common large data extensions under data dirs (also catch stray dumps)
+*.bmp
+*.npz
+*.npy
+*.hdf5
+*.h5
+*.parquet
+
+# ----- Archives / dumps -----
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+*.tgz
+
+# ----- Machine-local configs (absolute paths) -----
+Transfer/configs/*_local.yaml
+*_local.yaml
+
+# ----- DINOv3 carpet probe outputs / local weights -----
+dinov3_carpet_probe/outputs/
+dinov3_carpet_probe/weights/
+dinov3_carpet_probe/**/*.pth
+
+# ----- Misc local noise -----
+*.log
+*.tmp
+*.temp
+*.bak
+*.orig
+.DS_Store

@@ -1,0 +1,1 @@
+"""Crop selection and materialization."""

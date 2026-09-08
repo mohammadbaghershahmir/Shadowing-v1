@@ -1,0 +1,113 @@
+# CarpetShadeNet-V2 production config
+model:
+  name: CarpetShadeNetV2
+  local_size: 512
+  context_size: 1024
+  global_long_side: 1024
+  decoder_dim: 256
+  dino:
+    repo_root: "E:/Dino/dinov3"
+    checkpoint: "E:/Dino/dinov3/dinov3_carpet_probe/weights/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"
+    architecture: "dinov3_vitl16"
+    patch_size: 16
+    embed_dim: 1024
+    intermediate_layers: [-4, -3, -2, -1]
+    frozen: true
+    strict_load: true
+    cache_dir: "E:/Shadowing/Dataset_V2/global_tokens_csn_v2"
+  convnext:
+    architecture: "convnextv2_base"
+    model_name: "convnextv2_base.fcmae_ft_in22k_in1k"
+    pretrained: true
+    output_dims: [128, 256, 512, 1024]
+    output_strides: [4, 8, 16, 32]
+  structural_stem:
+    channels: [32, 64, 96]
+  fusion:
+    dim: 256
+    cross_attention_heads: 4
+    cross_attention_blocks: 1
+    sources: [convnext, dino_local, dino_context, dino_global]
+    dynamic_spatial_channel_gate: true
+    zero_init_residual: true
+  decoder:
+    channels: [256, 256, 192, 128, 96, 64]
+    learnable_pixelshuffle_upsampling: true
+    gated_lateral_fusion: true
+  heads:
+    where: true
+    transition: true
+    affinity_offsets: [1, 2, 4, 8]
+    level_classes: 3
+    ordinal_thresholds: 2
+    joint_decision: true
+    line_aware_refiner: true
+
+data:
+  dataset_root: "E:/Shadowing/Dataset_V2"
+  train_crops: "manifests/train_crops.jsonl"
+  crop_size: 512
+  context_size: 1024
+  global_long_side: 1024
+  allow_padded_context: true
+  augment_dihedral: false
+  oracle_input_diagnostic: false
+
+loss:
+  final_ce: 1.00
+  final_dice: 0.30
+  where: 0.50
+  level_ce: 0.50
+  ordinal: 0.20
+  transition: 0.50
+  affinity: 0.30
+  transition_boundary_dice: 0.40
+  overlap_consistency: 0.10
+  boundary_boost:
+    enabled: true
+    transition_dilate: 2
+    where_boost: 2.0
+    transition_boost: 3.0
+    affinity_boost: 2.0
+    level_ce_boost: 1.5
+
+optimizer:
+  lr_new_modules: 2.0e-4
+  lr_convnext_stage34: 2.0e-5
+  lr_convnext_stage12: 0.0
+  lr_dino: 0.0
+  weight_decay: 0.01
+  grad_clip: 1.0
+
+train:
+  micro_batch: 1
+  grad_accum: 4
+  amp: auto_bf16_else_fp16
+  total_steps: 12000
+  warmup_ratio: 0.03
+  schedule: cosine
+  min_lr: 1.0e-6
+  seed: 42
+  phase: 6
+  teacher_forcing: 0.0
+  checkpoint_every_steps: 200
+  plot_every_steps: 100
+  score_on_train: true
+  train_eval_max_batches: 64
+  disable_val: true
+  mode: train
+
+inference:
+  tile_size: 512
+  halo: 64
+  stride: 384
+  global_long_side: 1024
+
+renderer:
+  class_to_gray:
+    0: 255
+    1: 200
+    2: 150
+    3: 100
+  hard_black_lock: true
+  output_format: bmp
