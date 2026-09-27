@@ -58,13 +58,21 @@ class DynamicSpatialChannelGate(nn.Module):
         self.spatial_logits = nn.Conv2d(dim * num_branches, num_branches, 1)
         self.channel_logits = nn.Conv2d(dim * num_branches, num_branches * dim, 1)
 
-    def forward(self, branches: list[torch.Tensor]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    def forward(
+        self,
+        branches: list[torch.Tensor],
+        enabled_mask: tuple[bool, ...] | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         stacked = torch.cat(branches, dim=1)
         B, _, H, W = stacked.shape
         dim = branches[0].shape[1]
         spatial = self.spatial_logits(stacked)
-        spatial_w = F.softmax(spatial, dim=1)
         channel = self.channel_logits(stacked).view(B, 4, dim, H, W)
+        if enabled_mask is not None:
+            disable = (~torch.tensor(enabled_mask, device=spatial.device, dtype=torch.bool)).view(1, 4, 1, 1)
+            spatial = spatial.masked_fill(disable, float("-inf"))
+            channel = channel.masked_fill(disable.view(1, 4, 1, 1, 1), float("-inf"))
+        spatial_w = F.softmax(spatial, dim=1)
         channel_w = F.softmax(channel.mean(dim=(-2, -1), keepdim=True), dim=1)
         combined = spatial_w.unsqueeze(2) * channel_w
         combined = combined / combined.sum(dim=1, keepdim=True).clamp(min=1e-6)
@@ -73,6 +81,8 @@ class DynamicSpatialChannelGate(nn.Module):
 
 
 class FourBranchFusion(nn.Module):
+    BRANCH_NAMES = ("convnext", "dino_local", "dino_context", "dino_global")
+
     def __init__(
         self,
         fusion_dim: int = 256,
@@ -81,9 +91,19 @@ class FourBranchFusion(nn.Module):
         num_heads: int = 4,
         num_blocks: int = 1,
         zero_init_residual: bool = True,
+        sources: list[str] | None = None,
     ):
         super().__init__()
         self.fusion_dim = fusion_dim
+        enabled = list(sources) if sources else list(self.BRANCH_NAMES)
+        unknown = set(enabled) - set(self.BRANCH_NAMES)
+        if unknown:
+            raise ValueError(f"Unknown fusion sources {sorted(unknown)}; expected subset of {self.BRANCH_NAMES}")
+        if "convnext" not in enabled:
+            raise ValueError("fusion.sources must include 'convnext' (structural stem / ConvNeXt baseline)")
+        self.enabled_sources = tuple(enabled)
+        self._source_mask = tuple(name in enabled for name in self.BRANCH_NAMES)
+
         self.conv_proj = BranchAdapter(convnext_dim, fusion_dim)
         self.local_dino_adapter = TokenAdapter(dino_dim, fusion_dim)
         self.context_dino_adapter = TokenAdapter(dino_dim, fusion_dim)
@@ -114,7 +134,8 @@ class FourBranchFusion(nn.Module):
         B, _, H, W = c3.shape
         t_conv = self.branch_adapters[0](self.conv_proj(c3))
         t_local = self.branch_adapters[1](self.local_dino_adapter(dino_local))
-        ctx_map = self.local_dino_adapter(dino_context)
+        # Independent context adapter (weights are not shared with local).
+        ctx_map = self.context_dino_adapter(dino_context)
         q = t_conv.flatten(2).transpose(1, 2)
         kv_ctx = ctx_map.flatten(2).transpose(1, 2)
         for blk in self.context_blocks:
@@ -126,7 +147,15 @@ class FourBranchFusion(nn.Module):
         for blk in self.global_blocks:
             q_g = q_g + blk(q_g, kv_g, key_padding_mask=global_key_padding_mask)
         t_global = self.branch_adapters[3](q_g.transpose(1, 2).reshape(B, self.fusion_dim, H, W))
-        f_mix, gate_maps = self.gate([t_conv, t_local, t_context, t_global])
+
+        branches = [t_conv, t_local, t_context, t_global]
+        # Zero disabled ablation branches so the gate cannot use them.
+        for i, enabled in enumerate(self._source_mask):
+            if not enabled:
+                branches[i] = torch.zeros_like(branches[i])
+
+        f_mix, gate_maps = self.gate(branches, enabled_mask=self._source_mask)
         f16 = self.residual(f_mix, t_conv)
-        gate_maps["branches"] = torch.stack([t_conv, t_local, t_context, t_global], dim=1)
+        gate_maps["branches"] = torch.stack(branches, dim=1)
+        gate_maps["enabled_sources"] = self.enabled_sources
         return f16, gate_maps

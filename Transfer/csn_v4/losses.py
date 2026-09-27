@@ -1,4 +1,4 @@
-"""CSN-V4 loss module: categorical-only, full-crop supervision."""
+"""CSN-V4 loss module: BW factorized path + indexed_guided masked CE/Dice."""
 from __future__ import annotations
 
 import torch
@@ -7,6 +7,7 @@ import torch.nn.functional as F
 
 from csn_v4.config import LossConfig
 from csn_v4.constants import IGNORE_INDEX, NUM_CLASSES
+from csn_v4.indexed.schema import INTERNAL_NUM_CLASSES
 from csn_v4.masks import as_bool_mask, build_categorical_boundary_mask
 
 
@@ -102,13 +103,66 @@ def _combine_masks(*masks: torch.Tensor) -> torch.Tensor:
 
 
 class CSNV4Loss(nn.Module):
-    def __init__(self, cfg: LossConfig, ignore_index: int = IGNORE_INDEX):
+    def __init__(
+        self,
+        cfg: LossConfig,
+        ignore_index: int = IGNORE_INDEX,
+        *,
+        input_mode: str = "bw",
+    ):
         super().__init__()
         self.cfg = cfg
         self.ignore_index = ignore_index
+        self.input_mode = input_mode
         self.focal_bce = FocalBCELoss()
-        self.final_dice = SoftDiceLoss(NUM_CLASSES)
+        n_cls = INTERNAL_NUM_CLASSES if input_mode == "indexed_guided" else NUM_CLASSES
+        self.final_dice = SoftDiceLoss(n_cls)
         self.boundary_dice = BoundaryDiceLoss()
+
+    def _indexed_forward(
+        self,
+        outputs: dict[str, torch.Tensor],
+        targets: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        cfg = self.cfg
+        logits = outputs.get("indexed_logits", outputs["refined_logits"]).float()
+        if "internal_target" in targets:
+            labels = targets["internal_target"].long()
+        else:
+            labels = targets["target_class"].long()
+        if "allowed_mask" in targets:
+            m = as_bool_mask(targets["allowed_mask"])
+        else:
+            m = as_bool_mask(targets["valid_mask"])
+        if "supervision_weights" in targets:
+            sup_w = targets["supervision_weights"].float()
+            if sup_w.ndim == 2:
+                sup_w = sup_w.unsqueeze(0).expand(m.shape[0], -1, -1)
+            m = m & (sup_w > 0)
+        else:
+            sup_w = torch.ones_like(m, dtype=torch.float32)
+
+        labels_masked = labels.clone()
+        labels_masked[~m] = self.ignore_index
+        losses: dict[str, torch.Tensor] = {}
+        if m.any():
+            ce_map = F.cross_entropy(
+                logits, labels_masked, ignore_index=self.ignore_index, reduction="none"
+            )
+            w_ce = m.float() * sup_w
+            losses["final_ce"] = (ce_map * w_ce).sum() / w_ce.sum().clamp(min=1)
+            losses["final_dice"] = self.final_dice(logits, labels, m, sup_w)
+        else:
+            # Empty allowed region: zero loss, no NaN
+            losses["final_ce"] = logits.new_zeros(())
+            losses["final_dice"] = logits.new_zeros(())
+
+        total = cfg.final_ce * losses["final_ce"] + cfg.final_dice * losses["final_dice"]
+        losses["total"] = total
+        for k, v in losses.items():
+            if not torch.isfinite(v).all():
+                raise FloatingPointError(f"Non-finite loss component: {k}={v.item()}")
+        return losses
 
     def forward(
         self,
@@ -116,6 +170,9 @@ class CSNV4Loss(nn.Module):
         targets: dict[str, torch.Tensor],
         step: int = 0,
     ) -> dict[str, torch.Tensor]:
+        if self.input_mode == "indexed_guided" or "indexed_logits" in outputs:
+            return self._indexed_forward(outputs, targets)
+
         cfg = self.cfg
         valid = as_bool_mask(targets["valid_mask"])
         black_lock = as_bool_mask(targets["black_lock"])
@@ -160,58 +217,82 @@ class CSNV4Loss(nn.Module):
             losses["final_ce"] = logits.new_zeros(())
             losses["final_dice"] = logits.new_zeros(())
 
-        where_w = sup_w * _pixel_boost_weights(boundary_boost, cfg.boundary_boost.where_boost) if cfg.boundary_boost.enabled else sup_w
-        losses["where"] = self.focal_bce(
-            outputs["where_logits"], targets["where_target"],
-            _combine_masks(valid, ~black_lock, active), where_w,
-        )
+        if cfg.enable_where and cfg.where != 0.0:
+            where_w = (
+                sup_w * _pixel_boost_weights(boundary_boost, cfg.boundary_boost.where_boost)
+                if cfg.boundary_boost.enabled
+                else sup_w
+            )
+            losses["where"] = self.focal_bce(
+                outputs["where_logits"], targets["where_target"],
+                _combine_masks(valid, ~black_lock, active), where_w,
+            )
+        else:
+            losses["where"] = logits.new_zeros(())
 
-        level_logits = outputs["level_logits"]
-        level_tgt = targets["level_target"]
-        lt = level_tgt.clone()
-        lt[~level_mask] = self.ignore_index
-        if level_mask.any():
-            ce_lvl = F.cross_entropy(level_logits, lt, ignore_index=self.ignore_index, reduction="none")
-            w_lvl = level_mask.float() * sup_w
-            if cfg.boundary_boost.enabled:
-                w_lvl = w_lvl * _pixel_boost_weights(boundary_boost, cfg.boundary_boost.level_ce_boost)
-            losses["level_ce"] = (ce_lvl * w_lvl).sum() / w_lvl.sum().clamp(min=1)
+        if cfg.enable_level and cfg.level_ce != 0.0:
+            level_logits = outputs["level_logits"]
+            level_tgt = targets["level_target"]
+            lt = level_tgt.clone()
+            lt[~level_mask] = self.ignore_index
+            if level_mask.any():
+                ce_lvl = F.cross_entropy(level_logits, lt, ignore_index=self.ignore_index, reduction="none")
+                w_lvl = level_mask.float() * sup_w
+                if cfg.boundary_boost.enabled:
+                    w_lvl = w_lvl * _pixel_boost_weights(boundary_boost, cfg.boundary_boost.level_ce_boost)
+                losses["level_ce"] = (ce_lvl * w_lvl).sum() / w_lvl.sum().clamp(min=1)
+            else:
+                losses["level_ce"] = logits.new_zeros(())
         else:
             losses["level_ce"] = logits.new_zeros(())
 
-        trans_tgt = as_bool_mask(targets["transition_mask"]).float()
-        trans_w = sup_w * _pixel_boost_weights(boundary_boost, cfg.boundary_boost.transition_boost) if cfg.boundary_boost.enabled else sup_w
-        losses["transition"] = self.focal_bce(
-            outputs["transition_logits"], trans_tgt,
-            trans_mask, trans_w,
-        )
-        losses["transition_boundary_dice"] = self.boundary_dice(
-            outputs["transition_logits"], trans_tgt, trans_mask, trans_w,
-        )
+        if cfg.enable_transition and (cfg.transition != 0.0 or cfg.transition_boundary_dice != 0.0):
+            trans_tgt = as_bool_mask(targets["transition_mask"]).float()
+            trans_w = (
+                sup_w * _pixel_boost_weights(boundary_boost, cfg.boundary_boost.transition_boost)
+                if cfg.boundary_boost.enabled
+                else sup_w
+            )
+            losses["transition"] = self.focal_bce(
+                outputs["transition_logits"], trans_tgt, trans_mask, trans_w,
+            )
+            losses["transition_boundary_dice"] = self.boundary_dice(
+                outputs["transition_logits"], trans_tgt, trans_mask, trans_w,
+            )
+        else:
+            losses["transition"] = logits.new_zeros(())
+            losses["transition_boundary_dice"] = logits.new_zeros(())
 
-        aff_logits = outputs["affinity_logits"].float()
-        aff_tgt = targets["affinity_targets"].float()
-        aff_valid = targets["affinity_valid"] > 0.5
-        safe_tgt = torch.where(aff_valid, aff_tgt, torch.zeros_like(aff_tgt))
-        aff_boost = _pixel_boost_weights(boundary_boost, cfg.boundary_boost.affinity_boost) if cfg.boundary_boost.enabled else torch.ones_like(sup_w)
-        bce_map = F.binary_cross_entropy_with_logits(aff_logits, safe_tgt, reduction="none")
-        m = aff_valid & active.unsqueeze(1)
-        w = m.float() * sup_w.unsqueeze(1) * aff_boost.unsqueeze(1)
-        if m.any():
-            losses["affinity"] = (bce_map * w).sum() / w.sum().clamp(min=1)
+        if cfg.enable_affinity and cfg.affinity != 0.0:
+            aff_logits = outputs["affinity_logits"].float()
+            aff_tgt = targets["affinity_targets"].float()
+            aff_valid = targets["affinity_valid"] > 0.5
+            safe_tgt = torch.where(aff_valid, aff_tgt, torch.zeros_like(aff_tgt))
+            aff_boost = (
+                _pixel_boost_weights(boundary_boost, cfg.boundary_boost.affinity_boost)
+                if cfg.boundary_boost.enabled
+                else torch.ones_like(sup_w)
+            )
+            bce_map = F.binary_cross_entropy_with_logits(aff_logits, safe_tgt, reduction="none")
+            m = aff_valid & active.unsqueeze(1)
+            w = m.float() * sup_w.unsqueeze(1) * aff_boost.unsqueeze(1)
+            if m.any():
+                losses["affinity"] = (bce_map * w).sum() / w.sum().clamp(min=1)
+            else:
+                losses["affinity"] = logits.new_zeros(())
         else:
             losses["affinity"] = logits.new_zeros(())
 
-        base = outputs["base_logits"]
-        refined = outputs["refined_logits"]
-        # Keep refined close to base on shade pixels. Use logit-space MSE with
-        # detached base so residual heads stay active and the term is not
-        # numerically crushed to ~0 by softmax (as happened with 0/1-mask bugs).
-        m_cons = _combine_masks(shade_mask, valid, ~black_lock, active)
-        if m_cons.any():
-            diff = (refined.float() - base.float().detach()) ** 2
-            w = (m_cons.float() * sup_w).unsqueeze(1)
-            losses["base_refined_consistency"] = (diff * w).sum() / w.sum().clamp(min=1)
+        if cfg.enable_base_refined_consistency and cfg.base_refined_consistency != 0.0:
+            base = outputs["base_logits"]
+            refined = outputs["refined_logits"]
+            m_cons = _combine_masks(shade_mask, valid, ~black_lock, active)
+            if m_cons.any():
+                diff = (refined.float() - base.float().detach()) ** 2
+                w = (m_cons.float() * sup_w).unsqueeze(1)
+                losses["base_refined_consistency"] = (diff * w).sum() / w.sum().clamp(min=1)
+            else:
+                losses["base_refined_consistency"] = logits.new_zeros(())
         else:
             losses["base_refined_consistency"] = logits.new_zeros(())
 

@@ -36,11 +36,20 @@ def _valid_input_mask(
     return mask
 
 
-def _valid_core_mask(cw: int, ch: int, ix: int, iy: int, fw: int, fh: int) -> np.ndarray:
+def _valid_core_mask(
+    cw: int,
+    ch: int,
+    ix: int,
+    iy: int,
+    fw: int,
+    fh: int,
+    *,
+    halo: int,
+) -> np.ndarray:
     mask = np.zeros((ch, cw), dtype=bool)
     for dy in range(ch):
         for dx in range(cw):
-            gy, gx = iy + HALO + dy, ix + HALO + dx
+            gy, gx = iy + halo + dy, ix + halo + dx
             if 0 <= gy < fh and 0 <= gx < fw:
                 mask[dy, dx] = True
     return mask
@@ -61,6 +70,30 @@ def normalize_input_coords(ix: int, iy: int, iw: int, ih: int, fw: int, fh: int)
     return normalize_bbox(ix, iy, iw, ih, fw, fh)
 
 
+def resolve_geometry(
+    *,
+    input_size: int | None = None,
+    halo: int | None = None,
+    core_size: int | None = None,
+) -> tuple[int, int, int]:
+    """Resolve and validate tile geometry. YAML values must match or be complete."""
+    inp = INPUT_SIZE if input_size is None else int(input_size)
+    h = HALO if halo is None else int(halo)
+    if core_size is None:
+        c = inp - 2 * h
+    else:
+        c = int(core_size)
+    if h < 0:
+        raise ValueError(f"halo must be >= 0, got {h}")
+    if inp <= 0 or c <= 0:
+        raise ValueError(f"invalid input_size={inp} core_size={c}")
+    if inp != c + 2 * h:
+        raise ValueError(
+            f"Geometry contract violated: input_size ({inp}) != core_size ({c}) + 2*halo ({2 * h})"
+        )
+    return inp, h, c
+
+
 @dataclass(frozen=True)
 class TileSpec:
     image_wh: tuple[int, int]
@@ -69,6 +102,7 @@ class TileSpec:
     core_size_xy: tuple[int, int]
     input_origin_xy: tuple[int, int]
     input_size: int
+    halo: int
     valid_input_mask: np.ndarray
     valid_core_mask: np.ndarray
     input_bbox_norm: np.ndarray
@@ -77,7 +111,7 @@ class TileSpec:
 
     @property
     def crop_coords_norm(self) -> np.ndarray:
-        """Model coordinate embedding uses the 512×512 input window, not core-only box."""
+        """Model coordinate embedding uses the input window, not core-only box."""
         return self.input_bbox_norm
 
     @property
@@ -105,10 +139,10 @@ class TileSpec:
         return self.input_origin_xy[1]
 
     def model_core_y_slice(self) -> slice:
-        return slice(HALO, HALO + self.core_h)
+        return slice(self.halo, self.halo + self.core_h)
 
     def model_core_x_slice(self) -> slice:
-        return slice(HALO, HALO + self.core_w)
+        return slice(self.halo, self.halo + self.core_w)
 
     def model_core_slices(self) -> tuple[slice, slice]:
         return self.model_core_y_slice(), self.model_core_x_slice()
@@ -126,11 +160,14 @@ def build_tile_spec(
     input_size: int = INPUT_SIZE,
     scene_id: str = "",
 ) -> TileSpec:
+    input_size, halo, core_size = resolve_geometry(
+        input_size=input_size, halo=halo, core_size=core_size
+    )
     cw = min(core_size, fw - cx)
     ch = min(core_size, fh - cy)
     ix, iy = cx - halo, cy - halo
     valid_in = _valid_input_mask(ix, iy, input_size, fw, fh)
-    valid_core = _valid_core_mask(cw, ch, ix, iy, fw, fh)
+    valid_core = _valid_core_mask(cw, ch, ix, iy, fw, fh, halo=halo)
     input_bbox_norm = normalize_input_coords(ix, iy, input_size, input_size, fw, fh)
     core_bbox_norm = normalize_core_coords(cx, cy, cw, ch, fw, fh)
     return TileSpec(
@@ -140,6 +177,7 @@ def build_tile_spec(
         core_size_xy=(cw, ch),
         input_origin_xy=(ix, iy),
         input_size=input_size,
+        halo=halo,
         valid_input_mask=valid_in,
         valid_core_mask=valid_core,
         input_bbox_norm=input_bbox_norm,
@@ -194,10 +232,14 @@ def assert_full_coverage(
     specs: list[TileSpec] | None = None,
     *,
     core_size: int = CORE_SIZE,
+    halo: int = HALO,
+    input_size: int = INPUT_SIZE,
     allow_overwrite: bool = False,
 ) -> None:
     if specs is None:
-        specs = list(iter_core_tiles(fw, fh, core_size=core_size))
+        specs = list(
+            iter_core_tiles(fw, fh, core_size=core_size, halo=halo, input_size=input_size)
+        )
     cov = build_coverage_map(fw, fh, specs)
     real = np.ones((fh, fw), dtype=bool)
     holes = real & (cov == 0)

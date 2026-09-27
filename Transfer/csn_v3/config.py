@@ -169,6 +169,11 @@ class InferenceConfig:
     halo: int = 64
     stride: int = 384
     global_long_side: int = 1024
+    # core_paste: non-overlapping trusted cores (default). soft_overlap: blend logits in overlaps.
+    blend_mode: str = "core_paste"
+    # Average inverse-transformed class probabilities over D4 orientations at inference.
+    d4_tta: bool = False
+    d4_tta_orientations: list[int] = field(default_factory=lambda: list(range(8)))
 
 
 @dataclass

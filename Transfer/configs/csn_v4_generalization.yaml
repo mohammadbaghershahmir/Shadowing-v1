@@ -186,7 +186,30 @@ train:
 
   score_on_train: false
 
+  # Every N optimizer steps: save input|GT|pred on holdout scenes (training-unseen)
+  pred_viz_every_steps: 10
+
+  pred_viz_max_scenes: 2
+
   mode: generalization
+
+
+
+postprocess:
+
+  profile: conservative_cleanup
+
+  styles_root: styles
+
+  confidence_threshold: 0.55
+
+  style_influence: 0.5
+
+  min_region_pixels: 16
+
+  save_compare: true
+
+  save_change_map: true
 
 
 
@@ -199,6 +222,10 @@ inference:
   stride: 384
 
   global_long_side: 1024
+
+  blend_mode: core_paste
+
+  d4_tta: false
 
 
 

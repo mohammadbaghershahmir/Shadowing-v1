@@ -47,8 +47,17 @@ def build_supervision_weights(
     artifact_valid: np.ndarray,
     *,
     halo_loss_weight: float = 1.0,
+    transition_mask: np.ndarray | None = None,
+    shade_level_id: np.ndarray | None = None,
+    rare_shade_boost: float = 2.0,
+    transition_boost: float = 1.5,
+    small_detail_boost: float = 1.25,
 ) -> np.ndarray:
-    """Spatial loss weights: core=1.0, valid halo=halo_loss_weight, pad=0."""
+    """Spatial loss weights: core=1.0, valid halo=halo_loss_weight, pad=0.
+
+    Training-only boosts (from supervision targets, never fed as model inputs):
+    rare dark shade, transition bands, and small shade components.
+    """
     s = spec.input_size
     w = np.zeros((s, s), dtype=np.float32)
     ys, xs = spec.model_core_slices()
@@ -57,6 +66,22 @@ def build_supervision_weights(
     halo_ring = spec.valid_input_mask & (w == 0)
     w[halo_ring] = halo_loss_weight
     w[~spec.valid_input_mask] = 0.0
+
+    if transition_mask is not None and transition_boost != 1.0:
+        trans = transition_mask > 127 if transition_mask.dtype != np.bool_ else transition_mask
+        if trans.shape == w.shape:
+            w[trans & (w > 0)] *= transition_boost
+
+    if shade_level_id is not None and rare_shade_boost != 1.0:
+        # shade_level_id: 0=light, 1=medium, 2=dark (rare)
+        dark = shade_level_id == 2
+        if dark.shape == w.shape:
+            w[dark & (w > 0)] *= rare_shade_boost
+        # Mild boost for any shade pixel (helps small details vs empty white)
+        shade = (shade_level_id >= 0) & (shade_level_id <= 2)
+        if shade.shape == w.shape and small_detail_boost != 1.0:
+            w[shade & (w > 0)] *= small_detail_boost
+
     return w
 
 
@@ -119,7 +144,13 @@ def extract_tile_bundle(
         local_valid if local_valid is not None else np.ones((s, s), dtype=np.uint8) * 255,
         spec,
     )
-    supervision_weights = build_supervision_weights(spec, artifact_valid, halo_loss_weight=halo_loss_weight)
+    supervision_weights = build_supervision_weights(
+        spec,
+        artifact_valid,
+        halo_loss_weight=halo_loss_weight,
+        transition_mask=local_trans,
+        shade_level_id=local_level,
+    )
 
     return {
         "local_bw": local_bw,

@@ -127,7 +127,7 @@ class FourBranchFusion(nn.Module):
         t_conv = self.branch_adapters[0](self.conv_proj(c3))
         t_local = self.branch_adapters[1](self.local_dino_adapter(dino_local))
 
-        ctx_map = self.local_dino_adapter(dino_context)
+        ctx_map = self.context_dino_adapter(dino_context)
         q = t_conv.flatten(2).transpose(1, 2)
         kv_ctx = ctx_map.flatten(2).transpose(1, 2)
         for blk in self.context_blocks:

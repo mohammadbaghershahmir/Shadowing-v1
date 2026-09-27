@@ -149,20 +149,35 @@ class CheckpointManager:
         self._manifest_hashes = manifest_hashes_for_config(cfg)
         self._dino_sha256 = dino_checkpoint_sha256(cfg)
 
-    def _geometry_contract(self) -> dict[str, int]:
-        return {
-            "local_size": INPUT_SIZE,
-            "halo": HALO,
-            "core_size": CORE_SIZE,
-            "context_size": self.cfg.model.context_size,
-            "global_long_side": self.cfg.model.global_long_side,
-        }
-
     def _class_mapping(self) -> dict[str, Any]:
-        return {
+        input_mode = getattr(self.cfg.data, "input_mode", "bw")
+        mapping: dict[str, Any] = {
+            "input_mode": input_mode,
+            "indexed_schema": getattr(self.cfg.data, "indexed_schema", None),
+            "gray_adapter": getattr(self.cfg.data, "gray_adapter", None),
             "num_classes": NUM_CLASSES,
             "semantic_gray_to_class": {str(k): v for k, v in SEMANTIC_GRAY_TO_CLASS.items()},
             "class_to_gray": {str(k): v for k, v in CLASS_TO_GRAY.items()},
+        }
+        if input_mode == "indexed_guided":
+            from csn_v4.indexed.schema import (
+                INDEXED_SCHEMA_VERSION,
+                INTERNAL_NUM_CLASSES,
+                INTERNAL_TO_INDEX,
+            )
+
+            mapping["num_classes"] = INTERNAL_NUM_CLASSES
+            mapping["indexed_schema"] = INDEXED_SCHEMA_VERSION
+            mapping["internal_to_index"] = {str(k): v for k, v in INTERNAL_TO_INDEX.items()}
+        return mapping
+
+    def _geometry_contract(self) -> dict[str, int]:
+        return {
+            "local_size": INPUT_SIZE,
+            "halo": int(getattr(self.cfg.data, "halo", HALO)),
+            "core_size": int(getattr(self.cfg.data, "core_size", CORE_SIZE)),
+            "context_size": self.cfg.model.context_size,
+            "global_long_side": self.cfg.model.global_long_side,
         }
 
     def build_payload(
@@ -330,13 +345,29 @@ class CheckpointManager:
     def _verify_class_mapping(self, state: dict[str, Any]) -> None:
         stored = state.get("class_mapping") or {}
         current = self._class_mapping()
+        stored_mode = stored.get("input_mode", "bw")
+        if stored_mode != current["input_mode"]:
+            raise ValueError(
+                f"input_mode mismatch: checkpoint={stored_mode!r} current={current['input_mode']!r}. "
+                "BW and indexed_guided checkpoints are incompatible; "
+                "transfer backbone weights explicitly as initialization, not as resume."
+            )
         if stored.get("num_classes") != current["num_classes"]:
             raise ValueError(
                 f"num_classes mismatch: checkpoint={stored.get('num_classes')} "
                 f"current={current['num_classes']}"
             )
-        if stored.get("semantic_gray_to_class") != current["semantic_gray_to_class"]:
-            raise ValueError("semantic_gray_to_class mismatch between checkpoint and current constants")
+        if current["input_mode"] == "bw":
+            if stored.get("semantic_gray_to_class") != current["semantic_gray_to_class"]:
+                raise ValueError("semantic_gray_to_class mismatch between checkpoint and current constants")
+        else:
+            if stored.get("indexed_schema") != current.get("indexed_schema"):
+                raise ValueError(
+                    f"indexed_schema mismatch: checkpoint={stored.get('indexed_schema')!r} "
+                    f"current={current.get('indexed_schema')!r}"
+                )
+            if stored.get("internal_to_index") != current.get("internal_to_index"):
+                raise ValueError("internal_to_index mapping mismatch")
 
     def load(
         self,

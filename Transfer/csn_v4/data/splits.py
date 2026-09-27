@@ -74,17 +74,11 @@ def discover_scenes_from_source(source_root: Path) -> list[dict]:
 
 
 def _build_split_units(scenes: list[dict]) -> tuple[list[dict], list[str]]:
-    """Merge scenes sharing group_id OR source_sha256 into atomic split units."""
+    """Merge scenes sharing group/family/design OR source_sha256 into atomic units."""
     warnings: list[str] = []
     by_group: dict[str, list[dict]] = {}
     for s in scenes:
         by_group.setdefault(s["group_id"], []).append(s)
-
-    # Union groups linked by identical source_sha256
-    hash_to_groups: dict[str, set[str]] = {}
-    for gid, members in by_group.items():
-        for s in members:
-            hash_to_groups.setdefault(s["source_sha256"], set()).add(gid)
 
     parent = {gid: gid for gid in by_group}
 
@@ -99,14 +93,26 @@ def _build_split_units(scenes: list[dict]) -> tuple[list[dict], list[str]]:
         if ra != rb:
             parent[rb] = ra
 
-    for gids in hash_to_groups.values():
-        gids = sorted(gids)
-        if len(gids) > 1:
-            warnings.append(
-                f"source_sha256 links groups {gids}; forcing same split"
-            )
-            for g in gids[1:]:
-                unite(gids[0], g)
+    def _unite_linked(link_to_groups: dict[str, set[str]], label: str) -> None:
+        for key, gids in link_to_groups.items():
+            gids = sorted(gids)
+            if len(gids) > 1:
+                warnings.append(f"{label}={key!r} links groups {gids}; forcing same split")
+                for g in gids[1:]:
+                    unite(gids[0], g)
+
+    hash_to_groups: dict[str, set[str]] = {}
+    family_to_groups: dict[str, set[str]] = {}
+    design_to_groups: dict[str, set[str]] = {}
+    for gid, members in by_group.items():
+        for s in members:
+            hash_to_groups.setdefault(s["source_sha256"], set()).add(gid)
+            family_to_groups.setdefault(str(s["family_id"]), set()).add(gid)
+            design_to_groups.setdefault(str(s["design_id"]), set()).add(gid)
+
+    _unite_linked(hash_to_groups, "source_sha256")
+    _unite_linked(family_to_groups, "family_id")
+    _unite_linked(design_to_groups, "design_id")
 
     clusters: dict[str, list[dict]] = {}
     for gid, members in by_group.items():
@@ -117,10 +123,12 @@ def _build_split_units(scenes: list[dict]) -> tuple[list[dict], list[str]]:
     for root, members in clusters.items():
         gids = sorted({m["group_id"] for m in members})
         fids = sorted({m["family_id"] for m in members})
+        dids = sorted({m["design_id"] for m in members})
         units.append({
             "unit_id": root,
             "group_ids": gids,
             "family_ids": fids,
+            "design_ids": dids,
             "source_sha256": members[0]["source_sha256"],
             "scene_ids": [m["scene_id"] for m in members],
         })
@@ -208,6 +216,12 @@ def assert_no_split_leakage(train_scenes: list[dict], val_scenes: list[dict]) ->
     family_overlap = train_families & val_families
     if family_overlap:
         raise AssertionError(f"Split leakage: shared family_id {family_overlap}")
+
+    train_designs = {s["design_id"] for s in train_scenes}
+    val_designs = {s["design_id"] for s in val_scenes}
+    design_overlap = train_designs & val_designs
+    if design_overlap:
+        raise AssertionError(f"Split leakage: shared design_id {design_overlap}")
 
     train_hashes = {s["source_sha256"] for s in train_scenes}
     val_hashes = {s["source_sha256"] for s in val_scenes}

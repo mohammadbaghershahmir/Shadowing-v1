@@ -17,7 +17,7 @@ from csn_v4.data.tile_sample import (
     transform_scene,
 )
 
-MATERIALIZE_VERSION = "v1"
+MATERIALIZE_VERSION = "v2"
 
 
 def _safe_filename(sample_id: str) -> str:
@@ -41,48 +41,81 @@ def save_materialized_npz(path: Path, arrays: dict[str, np.ndarray], targets: di
         "affinity_targets": targets["affinity_targets"].numpy().astype(np.float16),
         "affinity_valid": targets["affinity_valid"].numpy().astype(np.uint8),
         "supervision_weights": targets["supervision_weights"].numpy().astype(np.float16),
-        "meta_json": np.array(json.dumps({
-            "sample_id": meta["sample_id"],
-            "tile_uid": meta["tile_uid"],
-            "global_cache_key": meta["global_cache_key"],
-            "transform_id": meta["transform_id"],
-            "split": meta["split"],
-            "scene_id": meta["scene_id"],
-            "letterbox_meta": meta["letterbox_meta"],
-            "materialize_version": MATERIALIZE_VERSION,
-        }), dtype=object),
+        "meta_json": np.asarray(
+            json.dumps({
+                "sample_id": meta["sample_id"],
+                "tile_uid": meta["tile_uid"],
+                "global_cache_key": meta["global_cache_key"],
+                "transform_id": meta["transform_id"],
+                "split": meta["split"],
+                "scene_id": meta["scene_id"],
+                "letterbox_meta": meta["letterbox_meta"],
+                "materialize_version": MATERIALIZE_VERSION,
+                "content_sha256": meta.get("content_sha256", ""),
+                "schema": meta.get("schema", "bw.semantic.v1"),
+            }),
+            dtype=np.str_,
+        ),
     }
     np.savez_compressed(path, **payload)
 
 
+def _parse_meta_json(raw) -> dict:
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, np.ndarray):
+        if raw.dtype == object or raw.dtype.kind == "O":
+            raw = raw.item()
+        else:
+            raw = raw.item() if raw.shape == () else raw.tolist()
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    return json.loads(str(raw))
+
+
 def load_materialized_npz(path: Path) -> dict:
-    with np.load(path, allow_pickle=True) as z:
-        meta = json.loads(str(z["meta_json"]))
-        targets = {
-            "target_class": torch.from_numpy(z["target_class"].astype(np.int64)),
-            "shade_mask": torch.from_numpy(z["shade_mask"] > 0),
-            "transition_mask": torch.from_numpy(z["transition_mask"].astype(np.uint8)),
-            "black_lock": torch.from_numpy(z["black_lock"] > 0),
-            "valid_mask": torch.from_numpy(z["valid_mask"] > 0),
-            "where_target": torch.from_numpy(z["where_target"].astype(np.float32)),
-            "level_target": torch.from_numpy(z["level_target"].astype(np.int64)),
-            "affinity_targets": torch.from_numpy(z["affinity_targets"].astype(np.float32)),
-            "affinity_valid": torch.from_numpy(z["affinity_valid"].astype(np.float32)),
-            "supervision_weights": torch.from_numpy(z["supervision_weights"].astype(np.float32)),
-        }
-        sample = {
-            "local_bw": torch.from_numpy(z["local_bw"].astype(np.float32) / 255.0).unsqueeze(0),
-            "context_bw": torch.from_numpy(z["context_bw"].astype(np.float32) / 255.0).unsqueeze(0),
-            "full_bw": torch.from_numpy(z["full_bw"].astype(np.float32) / 255.0).unsqueeze(0),
-            "crop_coords_norm": torch.from_numpy(z["crop_coords_norm"].astype(np.float32)),
-            "letterbox_meta": meta["letterbox_meta"],
-            "tile_uid": meta["tile_uid"],
-            "global_cache_key": meta["global_cache_key"],
-            "transform_id": int(meta["transform_id"]),
-            "split": meta["split"],
-            **targets,
-        }
-    return sample
+    """Load a materialized tile.
+
+    New files store meta_json as a unicode string (safe with allow_pickle=False).
+    Legacy v1 files used dtype=object; those still load via a pickle fallback.
+    Rematerialize with --overwrite to upgrade to the string meta format.
+    """
+    path = Path(path)
+
+    def _read(allow_pickle: bool) -> dict:
+        with np.load(path, allow_pickle=allow_pickle) as z:
+            meta = _parse_meta_json(z["meta_json"])
+            targets = {
+                "target_class": torch.from_numpy(z["target_class"].astype(np.int64)),
+                "shade_mask": torch.from_numpy(z["shade_mask"] > 0),
+                "transition_mask": torch.from_numpy(z["transition_mask"].astype(np.uint8)),
+                "black_lock": torch.from_numpy(z["black_lock"] > 0),
+                "valid_mask": torch.from_numpy(z["valid_mask"] > 0),
+                "where_target": torch.from_numpy(z["where_target"].astype(np.float32)),
+                "level_target": torch.from_numpy(z["level_target"].astype(np.int64)),
+                "affinity_targets": torch.from_numpy(z["affinity_targets"].astype(np.float32)),
+                "affinity_valid": torch.from_numpy(z["affinity_valid"].astype(np.float32)),
+                "supervision_weights": torch.from_numpy(z["supervision_weights"].astype(np.float32)),
+            }
+            return {
+                "local_bw": torch.from_numpy(z["local_bw"].astype(np.float32) / 255.0).unsqueeze(0),
+                "context_bw": torch.from_numpy(z["context_bw"].astype(np.float32) / 255.0).unsqueeze(0),
+                "full_bw": torch.from_numpy(z["full_bw"].astype(np.float32) / 255.0).unsqueeze(0),
+                "crop_coords_norm": torch.from_numpy(z["crop_coords_norm"].astype(np.float32)),
+                "letterbox_meta": meta["letterbox_meta"],
+                "tile_uid": meta["tile_uid"],
+                "global_cache_key": meta["global_cache_key"],
+                "transform_id": int(meta["transform_id"]),
+                "split": meta["split"],
+                **targets,
+            }
+
+    try:
+        return _read(allow_pickle=False)
+    except ValueError as exc:
+        if "allow_pickle" not in str(exc):
+            raise
+        return _read(allow_pickle=True)
 
 
 def materialize_manifest(

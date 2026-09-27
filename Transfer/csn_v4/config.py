@@ -28,7 +28,7 @@ class DataConfig:
     scenes: str = "manifests/scenes.jsonl"
     eval_full_images: str = "manifests/eval_full_images.jsonl"
     input_mode: str = "bw"
-    magenta_guide_dir: str = "E:/Shadowing/converted_ready"
+    magenta_guide_dir: str = ""
     crop_size: int = 512
     context_size: int = 1024
     global_long_side: int = 1024
@@ -42,6 +42,8 @@ class DataConfig:
     materialized_root: str = "materialized"
     prefer_materialized: bool = True
     dataloader_workers: int = 2
+    gray_adapter: str = "gray_legacy.v1"
+    indexed_schema: str = "indexed_guided.v1"
 
 
 @dataclass
@@ -56,6 +58,12 @@ class LossConfig:
     affinity: float = 0.3
     transition_boundary_dice: float = 0.4
     base_refined_consistency: float = 0.1
+    # Indexed-guided baseline: only masked CE/Dice unless explicitly enabled
+    enable_where: bool = True
+    enable_transition: bool = True
+    enable_affinity: bool = True
+    enable_level: bool = True
+    enable_base_refined_consistency: bool = True
     boundary_boost: BoundaryBoostConfig = field(default_factory=BoundaryBoostConfig)
 
 
@@ -88,8 +96,25 @@ class TrainConfig:
     eval_max_holdout_scenes: int = 1
     # During training scene holdout: how many D4 orients (1–8). Full 8 is very slow on large carpets.
     eval_holdout_max_orientations: int = 2
+    # Optimizer steps (no classic epochs). Holdout pred images every N steps.
+    pred_viz_every_steps: int = 10
+    pred_viz_max_scenes: int = 2
     weight_decay: float = 0.0
     mode: str = "overfit"
+
+
+@dataclass
+class PostprocessConfigYaml:
+    """Optional style-aware postprocess for pred_viz / UI (never affects training metrics)."""
+
+    profile: str = "conservative_cleanup"  # off | conservative_cleanup | miakhi
+    styles_root: str = "styles"
+    confidence_threshold: float = 0.55
+    style_influence: float = 0.5
+    min_region_pixels: int = 16
+    save_compare: bool = True
+    save_change_map: bool = True
+    user_style_selected: bool = False
 
 
 @dataclass
@@ -101,6 +126,7 @@ class CSNV4Config:
     train: TrainConfig = field(default_factory=TrainConfig)
     inference: InferenceConfig = field(default_factory=InferenceConfig)
     renderer: RendererConfig = field(default_factory=RendererConfig)
+    postprocess: PostprocessConfigYaml = field(default_factory=PostprocessConfigYaml)
 
     def resolved_micro_steps(self) -> int:
         if self.train.total_micro_steps is not None:
@@ -142,9 +168,20 @@ def _dict_to_config(d: dict) -> CSNV4Config:
         train=TrainConfig(**train_d),
         inference=InferenceConfig(**d.get("inference", {})),
         renderer=RendererConfig(**d.get("renderer", {})),
+        postprocess=PostprocessConfigYaml(**(d.get("postprocess") or {})),
     )
     if cfg.train.total_micro_steps is None:
         cfg.train.total_micro_steps = cfg.resolved_micro_steps()
+    # Enforce tile geometry contract from YAML (no silent ignore)
+    from csn_v4.geometry.tile_spec import resolve_geometry
+
+    resolve_geometry(
+        input_size=cfg.data.crop_size,
+        halo=cfg.data.halo,
+        core_size=cfg.data.core_size,
+    )
+    if cfg.data.input_mode not in ("bw", "magenta", "indexed_guided"):
+        raise ValueError(f"Unsupported data.input_mode={cfg.data.input_mode!r}")
     return cfg
 
 

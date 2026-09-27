@@ -170,7 +170,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--source-dataset", type=Path, default=Path("E:/Shadowing/Dataset_V2"))
     parser.add_argument("--reuse-source", action="store_true", help="Reuse Dataset_V2 samples/manifests")
     parser.add_argument("--skip-copy", action="store_true", help="Skip sample copy (manifests + D4 bake only)")
-    parser.add_argument("--sample-count", type=int, default=24)
+    parser.add_argument(
+        "--sample-count",
+        type=int,
+        default=0,
+        help="Max scenes to build (0 = all eligible independent scenes; positive = family-stratified cap)",
+    )
     parser.add_argument("--crop-sizes", type=int, nargs="+", default=[512])
     parser.add_argument("--eval-holdout", type=int, default=3)
     parser.add_argument("--min-boundary-score", type=float, default=0.0)

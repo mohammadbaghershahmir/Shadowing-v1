@@ -26,6 +26,8 @@ class RegionMetrics:
     per_class_iou: list[float] = field(default_factory=list)
     per_class_presence: list[int] = field(default_factory=list)
     global_miou: float = 0.0
+    # Mean IoU over classes present in GT *or* prediction — penalizes false-positive classes.
+    global_miou_fp: float = 0.0
     global_acc: float = 0.0
     boundary_miou: float = 0.0
     bf1_2px: float = 0.0
@@ -42,9 +44,12 @@ class RegionMetrics:
             "small_component_recall": self.small_component_recall,
             "small_component_f1": self.small_component_f1,
             "global_miou": self.global_miou,
+            "global_miou_fp": self.global_miou_fp,
             "global_acc": self.global_acc,
             "boundary_miou": self.boundary_miou,
             "bf1_2px": self.bf1_2px,
+            "per_class_iou": list(self.per_class_iou),
+            "per_class_presence": list(self.per_class_presence),
             "transform_id": float(self.transform_id),
         }
 
@@ -55,10 +60,30 @@ def _presence_aware_miou(pred: np.ndarray, target: np.ndarray, mask: np.ndarray,
         return 0.0, 0.0, [0.0] * num_classes, [0] * num_classes
     cm.update(pred, target, mask)
     present = [int((target[mask] == c).any()) for c in range(num_classes)]
-    ious = cm.iou_per_class()
+    ious = [float(x) for x in cm.iou_per_class()]
     active = [i for i, p in enumerate(present) if p]
     miou = float(np.mean([ious[i] for i in active])) if active else 0.0
     return miou, cm.pixel_accuracy(), ious, present
+
+
+def _fp_aware_miou(
+    pred: np.ndarray,
+    target: np.ndarray,
+    mask: np.ndarray,
+    num_classes: int = 4,
+) -> float:
+    """Mean IoU over classes present in GT or prediction (penalizes FP-only classes)."""
+    if not mask.any():
+        return 0.0
+    cm = ConfusionMatrix(num_classes=num_classes)
+    cm.update(pred, target, mask)
+    ious = [float(x) for x in cm.iou_per_class()]
+    t = target[mask]
+    p = pred[mask]
+    active = [c for c in range(num_classes) if (t == c).any() or (p == c).any()]
+    if not active:
+        return 0.0
+    return float(np.mean([ious[c] for c in active]))
 
 
 def _core_mask_from_specs(h: int, w: int) -> np.ndarray:
@@ -195,6 +220,7 @@ def compute_tile_region_metrics(
     )
     rm = RegionMetrics(transform_id=transform_id)
     rm.global_miou, rm.global_acc, ious, present = _presence_aware_miou(pred, target, supervised)
+    rm.global_miou_fp = _fp_aware_miou(pred, target, supervised)
     rm.boundary_miou = base.boundary_miou
     rm.bf1_2px = base.bf1_2px
 
@@ -234,6 +260,7 @@ def compute_region_metrics(
     )
     rm = RegionMetrics(transform_id=transform_id)
     rm.global_miou, rm.global_acc, ious, present = _presence_aware_miou(pred, target, supervised)
+    rm.global_miou_fp = _fp_aware_miou(pred, target, supervised)
     rm.boundary_miou = base.boundary_miou
     rm.bf1_2px = base.bf1_2px
 
@@ -268,7 +295,8 @@ def aggregate_region_metrics(results: list[RegionMetrics]) -> dict[str, float]:
         return {}
     keys = [
         "core_miou", "halo_miou", "corner_miou", "outer_border_miou", "seam_band_miou",
-        "global_miou", "boundary_miou", "bf1_2px", "small_component_recall", "small_component_f1",
+        "global_miou", "global_miou_fp", "boundary_miou", "bf1_2px",
+        "small_component_recall", "small_component_f1",
     ]
     out = {k: _nanmean([getattr(r, k) for r in results]) for k in keys}
     orient_means = []
@@ -277,4 +305,18 @@ def aggregate_region_metrics(results: list[RegionMetrics]) -> dict[str, float]:
         if subset:
             orient_means.append(float(np.mean(subset)))
     out["worst_orient_global_miou"] = float(min(orient_means)) if orient_means else float("nan")
+    orient_fp = []
+    for t in range(8):
+        subset = [x.global_miou_fp for x in results if x.transform_id == t]
+        if subset:
+            orient_fp.append(float(np.mean(subset)))
+    out["worst_orient_global_miou_fp"] = float(min(orient_fp)) if orient_fp else float("nan")
+    # Aggregate per-class IoU across orientations (nanmean per class index)
+    if results and len(results[0].per_class_iou) > 0:
+        n_cls = len(results[0].per_class_iou)
+        per_cls = []
+        for c in range(n_cls):
+            vals = [float(r.per_class_iou[c]) for r in results if len(r.per_class_iou) > c]
+            per_cls.append(_nanmean(vals))
+        out["per_class_iou_mean"] = per_cls
     return out

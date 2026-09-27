@@ -31,6 +31,7 @@ from csn_v4.metrics.checkpoint_score import score_from_region_results
 from csn_v4.metrics.region_metrics import RegionMetrics, aggregate_region_metrics, compute_tile_region_metrics
 from csn_v4.training import MetricsLogger, PhaseController, ShapeAuditor
 from csn_v4.training.checkpointing import CheckpointManager
+from csn_v4.training.pred_viz import save_holdout_pred_viz
 from csn_v3.data.targets import load_gray_bmp
 from shadow_model.optimizer_utils import audit_optimizer_coverage
 
@@ -103,10 +104,45 @@ def make_tile_loader(cfg, manifest_rel: str, *, shuffle: bool) -> DataLoader | N
         return None
     if len(ds) == 0:
         return None
+
+    sampler = None
+    shuffle_flag = shuffle
+    if shuffle:
+        # Oversample tiles that contain rare dark shade / transitions (train only).
+        # Validation loaders keep shuffle=False and no sampler (unbiased).
+        try:
+            from torch.utils.data import WeightedRandomSampler
+
+            records = getattr(ds, "tiles", None) or getattr(ds, "entries", None) or []
+            weights = []
+            for rec in records:
+                w = 1.0
+                if rec.get("has_dark_shade") or rec.get("shade_class") == "dark":
+                    w *= 2.0
+                if rec.get("has_transition") or rec.get("region") in ("transition", "boundary"):
+                    w *= 1.5
+                if rec.get("region") in ("corner", "small", "detail"):
+                    w *= 1.25
+                # Off-grid / capacity region tags from manifest_builder
+                reg = str(rec.get("sampling_region") or rec.get("region") or "")
+                if "transition" in reg:
+                    w *= 1.5
+                if "dark" in reg or "rare" in reg:
+                    w *= 2.0
+                weights.append(w)
+            if records and any(w > 1.0 for w in weights) and len(weights) == len(ds):
+                sampler = WeightedRandomSampler(
+                    weights, num_samples=len(weights), replacement=True,
+                )
+                shuffle_flag = False
+        except Exception as exc:  # noqa: BLE001 — fall back to uniform shuffle
+            LOGGER.debug("Weighted sampling unavailable: %s", exc)
+
     return DataLoader(
         ds,
         batch_size=cfg.train.micro_batch,
-        shuffle=shuffle,
+        shuffle=shuffle_flag,
+        sampler=sampler,
         collate_fn=collate_batch,
         num_workers=cfg.data.dataloader_workers,
         pin_memory=torch.cuda.is_available(),
@@ -419,10 +455,28 @@ def run_validation(
     else:
         scene_results = []
 
-    if cfg.train.mode == "generalization" and spat_results:
-        primary = spat_results
+    # Generalization: primary / best.pt must come from independent scene holdout.
+    # Capacity & spatial are diagnostic only (train-scene tiles) — never promote them.
+    if cfg.train.mode == "generalization":
+        if scene_results:
+            primary = scene_results
+            summary["generalization_status"] = "evaluated"
+        else:
+            primary = []
+            summary["generalization_status"] = "unevaluated"
+            summary["checkpoint_score_v4"] = float("nan")
+            LOGGER.warning(
+                "Generalization mode without independent scene holdout metrics — "
+                "best.pt will NOT be updated from train/spatial scores "
+                "(score_on_train=%s is ignored for best.pt).",
+                cfg.train.score_on_train,
+            )
     else:
-        primary = cap_results or spat_results or scene_results
+        # Capacity / overfit modes may score on train tiles by design.
+        if cfg.train.score_on_train:
+            primary = cap_results or spat_results or scene_results
+        else:
+            primary = scene_results or spat_results or cap_results
     if primary:
         primary_agg = _metrics_to_dict(primary)
         summary.update(primary_agg)
@@ -441,11 +495,33 @@ def save_best_checkpoints(
     global_step: int,
     optimizer_step: int,
     grad_accum_pending: int,
+    cfg=None,
 ) -> None:
-    for kind in ("capacity", "spatial", "scene_val", "overall"):
+    kinds = ["capacity", "spatial", "scene_val"]
+    # best.pt ("overall") only from independent scene_val in generalization mode.
+    mode = getattr(getattr(cfg, "train", None), "mode", None) if cfg is not None else None
+    if mode == "generalization":
+        scene_score = _kind_score(eval_summary, "scene_val")
+        if scene_score is not None and eval_summary.get("generalization_status") != "unevaluated":
+            kinds.append("overall")
+            eval_summary = dict(eval_summary)
+            eval_summary["checkpoint_score_v4"] = scene_score
+        else:
+            LOGGER.info(
+                "Skipping best.pt update: no independent scene_val score "
+                "(status=%s)",
+                eval_summary.get("generalization_status", "unknown"),
+            )
+    else:
+        kinds.append("overall")
+
+    for kind in kinds:
         score = _kind_score(eval_summary, kind)
         if score is None:
             continue
+        # Keep capacity/spatial as separately named diagnostics
+        if kind in ("capacity", "spatial") and mode == "generalization":
+            LOGGER.info("Diagnostic %s score=%.4f (not used for best.pt)", kind, score)
         saved = ckpt_mgr.save_best(
             kind, score,
             model=model, optimizer=optimizer, scheduler=scheduler, scaler=scaler,
@@ -454,7 +530,8 @@ def save_best_checkpoints(
             metrics=eval_summary,
         )
         if saved:
-            LOGGER.info("★ New best_%s score=%.4f → %s", kind if kind != "overall" else "overall (best.pt)", score, saved)
+            label = "overall (best.pt)" if kind == "overall" else kind
+            LOGGER.info("★ New best_%s score=%.4f → %s", label, score, saved)
 
 
 def run_eval_step(
@@ -509,6 +586,7 @@ def run_eval_step(
         model=model, optimizer=optimizer, scheduler=scheduler, scaler=scaler,
         global_step=global_step, optimizer_step=optimizer_step,
         grad_accum_pending=grad_accum_pending,
+        cfg=cfg,
     )
     LOGGER.info(
         "VALIDATION opt=%d | primary gm=%.4f bm=%.4f wd4=%.4f score=%.4f | "
@@ -597,7 +675,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
         weight_decay=cfg.optimizer.weight_decay,
     )
-    criterion = CSNV4Loss(cfg.loss)
+    criterion = CSNV4Loss(cfg.loss, input_mode=getattr(cfg.data, "input_mode", "bw"))
     amp_dtype, scaler = resolve_amp(cfg, device)
     scheduler = build_scheduler(optimizer, cfg)
 
@@ -621,15 +699,36 @@ def main(argv: list[str] | None = None) -> int:
         grad_accum_pending = int(loaded_state.get("grad_accum_pending", 0))
         last_eval_metrics = loaded_state.get("metrics")
         LOGGER.info("Resumed from opt_step=%d micro=%d pending_accum=%d", optimizer_step, global_step, grad_accum_pending)
+        # Resume contract: pending micro-batches mean we continue accumulation;
+        # do NOT wipe valid restored grads (optimizer state is restored; grads
+        # themselves are not serialized — restart accumulation cleanly only when pending==0).
+        if grad_accum_pending == 0:
+            optimizer.zero_grad(set_to_none=True)
+        else:
+            LOGGER.warning(
+                "Resume with grad_accum_pending=%d: micro-batch grads are not in the "
+                "checkpoint; restarting accumulation from 0 for safety.",
+                grad_accum_pending,
+            )
+            grad_accum_pending = 0
+            optimizer.zero_grad(set_to_none=True)
 
     if resume_state is None and not args.skip_audit:
         audit_optimizer_coverage(model, optimizer)
         auditor = ShapeAuditor()
-        auditor.save(
-            run_dir / "shape_audit.json",
-            auditor.audit_forward(model, train_loader.dataset[0], device),
-            auditor.audit_backward(model, train_loader.dataset[0], device),
-        )
+        sample0 = train_loader.dataset[0]
+        fwd = auditor.audit_forward(model, sample0, device)
+        grad = auditor.audit_backward(model, sample0, device, criterion=criterion)
+        auditor.save(run_dir / "shape_audit.json", fwd, grad)
+        if not grad.get("passed", False):
+            missing = grad.get("missing_groups") or []
+            raise RuntimeError(
+                f"Shape/gradient audit FAILED; disconnected groups: {missing}. "
+                f"See {run_dir / 'shape_audit.json'}. Pass --skip-audit only after fixing."
+            )
+        # Fresh training: ensure no leftover grads before first batch
+        optimizer.zero_grad(set_to_none=True)
+        model.zero_grad(set_to_none=True)
 
     metrics_logger = MetricsLogger(run_dir, cfg.train.plot_every_steps)
     model.train()
@@ -685,7 +784,10 @@ def main(argv: list[str] | None = None) -> int:
         }
         losses = criterion(out, targets, global_step)
         loss = losses["total"] / cfg.train.grad_accum
-        aff_valid_frac = float((targets["affinity_valid"] > 0.5).float().mean().item())
+        if "affinity_valid" in targets:
+            aff_valid_frac = float((targets["affinity_valid"] > 0.5).float().mean().item())
+        else:
+            aff_valid_frac = 0.0
         for k, v in losses.items():
             loss_accum[k] = loss_accum.get(k, 0.0) + float(v.item())
         aff_frac_accum += aff_valid_frac
@@ -702,36 +804,50 @@ def main(argv: list[str] | None = None) -> int:
                 scaler.unscale_(optimizer)
             clip_grad_norm_(model.parameters(), cfg.optimizer.grad_clip)
             if scaler:
+                scale_before = scaler.get_scale()
                 scaler.step(optimizer)
                 scaler.update()
+                # When step is skipped, scale decreases
+                stepped = scaler.get_scale() >= scale_before
             else:
                 optimizer.step()
-            scheduler.step()
+                stepped = True
+            if stepped:
+                scheduler.step()
+                optimizer_step += 1
+                did_opt_step = True
+            else:
+                LOGGER.warning(
+                    "GradScaler skipped optimizer step at micro=%d; scheduler not advanced.",
+                    global_step,
+                )
             optimizer.zero_grad(set_to_none=True)
-            optimizer_step += 1
             grad_accum_pending = 0
-            did_opt_step = True
 
-            n_micro = max(1, cfg.train.grad_accum)
-            loss_row = {k: v / n_micro for k, v in loss_accum.items()}
-            loss_row["lr"] = optimizer.param_groups[0]["lr"]
-            loss_row["aff_valid_frac"] = aff_frac_accum / n_micro
-            metrics_logger.log_loss(optimizer_step, loss_row, optimizer_step=optimizer_step)
-            loss_accum = {}
-            aff_frac_accum = 0.0
+            if not did_opt_step:
+                loss_accum = {}
+                aff_frac_accum = 0.0
+            else:
+                n_micro = max(1, cfg.train.grad_accum)
+                loss_row = {k: v / n_micro for k, v in loss_accum.items()}
+                loss_row["lr"] = optimizer.param_groups[0]["lr"]
+                loss_row["aff_valid_frac"] = aff_frac_accum / n_micro
+                metrics_logger.log_loss(optimizer_step, loss_row, optimizer_step=optimizer_step)
+                loss_accum = {}
+                aff_frac_accum = 0.0
 
-            pbar.set_postfix(
-                format_tqdm_postfix(
-                    {k: torch.tensor(v) for k, v in loss_row.items() if k not in ("lr", "aff_valid_frac")},
-                    optimizer_step=optimizer_step,
-                    total_opt_steps=opt_total,
-                    lr=loss_row["lr"],
-                    eval_metrics=last_eval_metrics,
-                    aff_valid_frac=loss_row.get("aff_valid_frac"),
-                ),
-                refresh=True,
-            )
-            pbar.update(1)
+                pbar.set_postfix(
+                    format_tqdm_postfix(
+                        {k: torch.tensor(v) for k, v in loss_row.items() if k not in ("lr", "aff_valid_frac")},
+                        optimizer_step=optimizer_step,
+                        total_opt_steps=opt_total,
+                        lr=loss_row["lr"],
+                        eval_metrics=last_eval_metrics,
+                        aff_valid_frac=loss_row.get("aff_valid_frac"),
+                    ),
+                    refresh=True,
+                )
+                pbar.update(1)
 
         global_step += 1
 
@@ -742,6 +858,19 @@ def main(argv: list[str] | None = None) -> int:
                 grad_accum_pending=grad_accum_pending,
                 metrics={"last_loss": loss_row},
             )
+
+        viz_every = int(getattr(cfg.train, "pred_viz_every_steps", 0) or 0)
+        if did_opt_step and viz_every > 0 and optimizer_step > 0 and optimizer_step % viz_every == 0:
+            LOGGER.info(
+                "Saving holdout prediction viz at optimizer_step=%d (unseen scenes only) …",
+                optimizer_step,
+            )
+            save_holdout_pred_viz(
+                model, cfg, device, run_dir,
+                optimizer_step=optimizer_step,
+                max_scenes=int(getattr(cfg.train, "pred_viz_max_scenes", 2)),
+            )
+            model.train()
 
         if did_opt_step and optimizer_step > 0 and optimizer_step % cfg.train.eval_every_steps == 0:
             # capacity + spatial tiles + scene holdout (3 scenes, limited D4) every eval

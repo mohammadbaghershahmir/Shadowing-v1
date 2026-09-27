@@ -29,14 +29,51 @@ def main(argv: list[str] | None = None) -> int:
     ])
     parser.add_argument("--output-dir", type=Path, default=Path("eval_v4"))
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument(
+        "--all-orientations",
+        action="store_true",
+        help="Force all 8 D4 orientations (final model comparison).",
+    )
+    parser.add_argument(
+        "--max-orientations",
+        type=int,
+        default=None,
+        help="Limit D4 orientations for quick diagnostics (ignored if --all-orientations).",
+    )
+    parser.add_argument(
+        "--blend-mode",
+        type=str,
+        default=None,
+        choices=["core_paste", "soft_overlap"],
+        help="Override inference.blend_mode for this eval run.",
+    )
+    parser.add_argument(
+        "--d4-tta",
+        action="store_true",
+        help="Enable D4 test-time augmentation (inverse-average probabilities).",
+    )
     args = parser.parse_args(argv)
 
     cfg = load_config(args.config)
     if args.dataset_root:
         cfg.data.dataset_root = str(args.dataset_root)
+    if args.blend_mode:
+        cfg.inference.blend_mode = args.blend_mode
+    if args.d4_tta:
+        cfg.inference.d4_tta = True
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    model = load_model_from_checkpoint(args.checkpoint, cfg, device)
-    evaluator = CSNV4Evaluator(model, cfg, device)
+    # load_model_from_checkpoint(path, config_path=..., *, device=...) → (model, ckpt)
+    model, _ckpt = load_model_from_checkpoint(
+        args.checkpoint,
+        args.config,
+        device=device,
+    )
+    # Honor CLI overrides after checkpoint rebuild.
+    model.cfg.data.dataset_root = cfg.data.dataset_root
+    model.cfg.inference.blend_mode = cfg.inference.blend_mode
+    model.cfg.inference.d4_tta = cfg.inference.d4_tta
+    evaluator = CSNV4Evaluator(model, model.cfg, device)
+
 
     manifest_map = {
         "val_scene_holdout": "manifests/val_scene_holdout_bw.jsonl",
@@ -72,9 +109,18 @@ def main(argv: list[str] | None = None) -> int:
             trans = load_gray_bmp(full_dir / "transition_mask.bmp") if (full_dir / "transition_mask.bmp").exists() else None
             valid = load_gray_bmp(full_dir / "valid_mask.bmp") if (full_dir / "valid_mask.bmp").exists() else None
             black = load_gray_bmp(full_dir / "black_lock.bmp") if (full_dir / "black_lock.bmp").exists() else None
+            orients = (
+                list(range(8)) if args.all_orientations
+                else (list(range(args.max_orientations)) if args.max_orientations else None)
+            )
+            if args.d4_tta:
+                # TTA already averages over D4 internally — evaluate once in identity space.
+                orients = [0]
             res = evaluator.evaluate_all_orientations(
                 src, sem, scene_id=sid,
                 transition_mask=trans, valid_mask=valid, black_lock=black,
+                require_all=False if args.d4_tta else (args.all_orientations or args.max_orientations is None),
+                orientations=orients,
             )
             results.append(res.to_dict())
     else:

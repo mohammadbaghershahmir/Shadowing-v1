@@ -3,6 +3,12 @@
 Self-contained setup: **only bring `converted_output`** (5-color BMP ground truth).  
 V3 and V4 are built automatically on the new machine — no need to copy Dataset_V1/V2/V3.
 
+**New primary mode:** `indexed_guided` (see [`docs/INDEXED_GUIDED.md`](docs/INDEXED_GUIDED.md)).  
+Legacy `bw` remains available as a separate `input_mode` (checkpoints are not interchangeable).
+
+Docs: [RUNBOOK](docs/RUNBOOK.md) · [Engineering report](docs/ENGINEERING_REPORT.md)
+
+
 ## What you need on the new system
 
 | Item | Description |

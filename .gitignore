@@ -65,9 +65,13 @@ runs/
 **/tb_logs/
 
 # ----- Datasets & generated tiles (GB-scale) -----
+# Ignore data roots only — keep Python package Transfer/dataset_v2/ tracked.
 converted_output/
 Dataset_V1/
-Dataset_V2/
+/Dataset_V2/
+**/Dataset_V2/
+!Transfer/dataset_v2/
+!Transfer/dataset_v2/**
 Dataset_V3/
 Dataset_V4/
 **/materialized/

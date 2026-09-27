@@ -24,21 +24,24 @@ class ResidualBlock(nn.Module):
 class HighResStructuralStem(nn.Module):
     """Trainable stem preserving 1px structures.
 
-    Input: line_mask [B,1,512,512]
+    Input:
+      - bw mode: line_mask [B,1,H,W]
+      - indexed_guided: structural channels [B,3,H,W] for (X==0, X==1, X==2)
     Outputs:
-        H0: [B,32,512,512] stride 1
-        H1: [B,64,256,256] stride 2
-        H2: [B,96,128,128] stride 4
+        H0: [B,32,H,W] stride 1
+        H1: [B,64,H/2,W/2] stride 2
+        H2: [B,96,H/4,W/4] stride 4
     """
 
-    def __init__(self, channels: list[int] | None = None):
+    def __init__(self, channels: list[int] | None = None, in_channels: int = 1):
         super().__init__()
         if channels is None:
             channels = [32, 64, 96]
         c0, c1, c2 = channels
+        self.in_channels = in_channels
 
         self.stem_in = nn.Sequential(
-            nn.Conv2d(1, c0, 3, stride=1, padding=1, bias=False),
+            nn.Conv2d(in_channels, c0, 3, stride=1, padding=1, bias=False),
             nn.GroupNorm(min(32, c0), c0),
             nn.GELU(),
         )
@@ -57,8 +60,12 @@ class HighResStructuralStem(nn.Module):
         self.block2 = ResidualBlock(c2)
         self.out_channels = (c0, c1, c2)
 
-    def forward(self, line_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        h0 = self.block0(self.stem_in(line_mask))
+    def forward(self, structural: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if structural.shape[1] != self.in_channels:
+            raise ValueError(
+                f"StructuralStem expected {self.in_channels} channels, got {structural.shape[1]}"
+            )
+        h0 = self.block0(self.stem_in(structural))
         h1 = self.block1(self.down1(h0))
         h2 = self.block2(self.down2(h1))
         return h0, h1, h2

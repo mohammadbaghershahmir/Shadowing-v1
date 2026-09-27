@@ -47,7 +47,7 @@ def test_same_sha256_different_groups_stay_together():
     assert ("scene_0" in train_ids) == ("scene_1" in train_ids)
 
 
-def test_same_family_different_groups_can_split_without_leakage():
+def test_same_family_different_groups_stay_together():
     scenes = [
         _scene(0, group="g0"),
         _scene(1, group="g1"),
@@ -57,11 +57,40 @@ def test_same_family_different_groups_can_split_without_leakage():
     ]
     for s in scenes:
         s["family_id"] = "family_A"
+        s["design_id"] = f"design_{s['group_id']}"
     split = assign_scene_splits(scenes, seed=7)
-    # family_id overlap is allowed only if groups differ — our checker flags family overlap
-    # With same family_id on all, assert_no_split_leakage should fail if split crosses families
-    with pytest.raises(AssertionError, match="family_id"):
+    # Shared family_id forces a single split unit → no family leakage possible.
+    assert split.policy == "intra_scene_spatial_only" or (
+        {s["family_id"] for s in split.train_scenes} & {s["family_id"] for s in split.val_scenes} == set()
+    )
+    if split.val_scenes:
         assert_no_split_leakage(split.train_scenes, split.val_scenes)
+
+
+def test_same_design_id_stay_together():
+    scenes = [
+        _scene(0, group="g0"),
+        _scene(1, group="g1"),
+        _scene(2, group="g2"),
+    ]
+    for s in scenes:
+        s["design_id"] = "design_shared"
+        s["family_id"] = s["group_id"]
+    split = assign_scene_splits(scenes, seed=3)
+    assert split.n_groups == 1
+    assert len(split.val_scenes) == 0
+    assert split.policy == "intra_scene_spatial_only"
+
+
+def test_design_id_leakage_detected():
+    train = [_scene(0, group="g0")]
+    val = [_scene(1, group="g1")]
+    train[0]["design_id"] = "d_shared"
+    val[0]["design_id"] = "d_shared"
+    train[0]["family_id"] = "f0"
+    val[0]["family_id"] = "f1"
+    with pytest.raises(AssertionError, match="design_id"):
+        assert_no_split_leakage(train, val)
 
 
 def test_single_group_all_train():

@@ -67,6 +67,39 @@ class CSNV4Evaluator:
         specs = list(iter_core_tiles(w, h, transform_id=transform_id, scene_id=scene_id))
         assert_full_coverage(w, h, specs)
 
+        blend = getattr(self.cfg.inference, "blend_mode", "core_paste")
+        use_tta = bool(getattr(self.cfg.inference, "d4_tta", False)) and transform_id == 0
+        if use_tta:
+            # TTA is defined in original image space (average inverse-mapped probs).
+            pred = tiled_predict(
+                self.model,
+                source_bw,
+                self.device,
+                context_size=self.cfg.model.context_size,
+                global_long_side=self.cfg.model.global_long_side,
+                transform_id=0,
+                scene_id=scene_id,
+                input_mode=self.cfg.data.input_mode,
+                blend_mode=blend,
+                d4_tta=True,
+                d4_tta_orientations=getattr(
+                    self.cfg.inference, "d4_tta_orientations", list(range(8))
+                ),
+            )
+            # Metrics against original (untransformed) target
+            tgt_class = semantic_gray_to_class(
+                torch.from_numpy(target_semantic.astype(np.int64))
+            ).numpy()
+            trans = transition_mask if transition_mask is not None else np.zeros_like(target_semantic, dtype=np.uint8)
+            valid = valid_mask if valid_mask is not None else np.ones_like(target_semantic, dtype=np.uint8) * 255
+            black = black_lock if black_lock is not None else (target_semantic == 0).astype(np.uint8) * 255
+            return compute_region_metrics(
+                pred, tgt_class, trans, valid, black,
+                transform_id=transform_id,
+                boundary_dilate=self.cfg.data.boundary_dilate,
+                skip_small_component=skip_small_component,
+            )
+
         pred = tiled_predict(
             self.model,
             src_t,
@@ -76,6 +109,8 @@ class CSNV4Evaluator:
             transform_id=transform_id,
             scene_id=scene_id,
             input_mode=self.cfg.data.input_mode,
+            blend_mode=blend,
+            d4_tta=False,  # per-orientation eval; D4-TTA is a separate inference mode
         )
 
         tgt_class = semantic_gray_to_class(torch.from_numpy(sem_t.astype(np.int64))).numpy()
